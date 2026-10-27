@@ -235,6 +235,32 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     return lo;
   }
 
+  /**
+   * Gives the window of a primitive {@code long} key, as {@link InlineKey#LONG} gives it for the
+   * boxed key, with the sign bit flipped.
+   */
+  private static long longWindow(long key, int prefix) {
+    long encoded = key ^ Long.MIN_VALUE;
+    return (prefix >= Long.BYTES ? 0L : encoded << (prefix << 3)) ^ Long.MIN_VALUE;
+  }
+
+  /**
+   * Finds a primitive key in a leaf of a map with {@link InlineKey#LONG}. Equal windows of that
+   * key type are equal keys, so this search reads no key object.
+   */
+  private int findLong(Node node, long key) {
+    long[] w = node.windows;
+    long position = scan.scan(w, Math.min(node.count, w.length), longWindow(key, node.prefix));
+    int lo = (int) (position >>> 32);
+    return lo == (int) position ? -lo - 1 : lo;
+  }
+
+  /** Gives the child of an inner node for a primitive key, as {@link #findLong} does. */
+  private int childIndexLong(Inner node, long key) {
+    long[] w = node.windows;
+    return (int) scan.scan(w, Math.min(node.count, w.length), longWindow(key, node.prefix));
+  }
+
   // ---------------------------------------------------------------------------------------------
   // Reads
 
@@ -281,6 +307,51 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     return get(key) != null;
   }
 
+  /** Gives true if the map uses {@link InlineKey#LONG}, which the primitive methods need. */
+  boolean hasLongKeys() {
+    return inline == InlineKey.LONG;
+  }
+
+  /**
+   * Looks up a primitive key, as {@link #get} does for the boxed key, with no key object. Call
+   * it only when {@link #hasLongKeys()} is true.
+   */
+  @SuppressWarnings("unchecked")
+  V getLong(long key) {
+    restart:
+    while (true) {
+      Node node = root;
+      long v = node.version();
+      if (Node.isLocked(v) || node != root) {
+        Thread.onSpinWait();
+        continue;
+      }
+      try {
+        while (node instanceof Inner inner) {
+          Node child = inner.children[childIndexLong(inner, key)];
+          long cv = child.version();
+          if (Node.isLocked(cv) || !inner.validate(v)) {
+            Thread.onSpinWait();
+            continue restart;
+          }
+          node = child;
+          v = cv;
+        }
+        Leaf leaf = (Leaf) node;
+        int pos = findLong(leaf, key);
+        Object value = pos >= 0 ? leaf.values[pos] : null;
+        if (leaf.validate(v)) {
+          return (V) value;
+        }
+      } catch (RuntimeException e) {
+        // A torn read can see a null child during a split.
+        if (node.validate(v)) {
+          throw e;
+        }
+      }
+    }
+  }
+
   /**
    * Looks up many keys at the same time. The lookups go down the tree one level at a time,
    * together, so that the CPU waits for the cache misses of different lookups in parallel.
@@ -295,31 +366,51 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
    * @param results the array that receives the value of {@code keys[i]} at index {@code i}, or
    *     {@code null} if the map does not have the key; at least as long as {@code keys}
    */
-  @SuppressWarnings("unchecked")
   public void getMany(K[] keys, V[] results) {
     if (results.length < keys.length) {
       throw new IllegalArgumentException("results is shorter than keys");
     }
-    int lanes = Math.min(BATCH_LANES, keys.length);
+    for (K k : keys) {
+      Objects.requireNonNull(k);
+    }
+    getMany(keys, null, keys.length, results);
+  }
+
+  /**
+   * Looks up many primitive keys, as {@link #getMany} does. Call it only when {@link
+   * #hasLongKeys()} is true.
+   */
+  void getManyLong(long[] keys, Object[] results) {
+    if (results.length < keys.length) {
+      throw new IllegalArgumentException("results is shorter than keys");
+    }
+    getMany(null, keys, keys.length, results);
+  }
+
+  /**
+   * The batch lookup of {@link #getMany} and {@link #getManyLong}. Exactly one of {@code keys}
+   * and {@code longKeys} is not {@code null}.
+   */
+  private void getMany(Object[] keys, long[] longKeys, int length, Object[] results) {
+    int lanes = Math.min(BATCH_LANES, length);
     Node[] nodes = new Node[lanes];
     Node[] children = new Node[lanes];
     long[] versions = new long[lanes];
     // The sum of the loads that only start cache misses. The final check keeps the JIT from
     // removing them.
     long touched = 0;
-    for (int start = 0; start < keys.length; start += lanes) {
-      int n = Math.min(lanes, keys.length - start);
-      for (int j = 0; j < n; j++) {
-        K k = Objects.requireNonNull(keys[start + j]);
-        if (inline != null) {
-          touched += inline.window(k, 0) & 1;
+    for (int start = 0; start < length; start += lanes) {
+      int n = Math.min(lanes, length - start);
+      if (keys != null && inline != null) {
+        for (int j = 0; j < n; j++) {
+          touched += inline.window(key(keys[start + j]), 0) & 1;
         }
       }
       Node top = root;
       long tv = top.version();
       if (Node.isLocked(tv) || top != root) {
         for (int j = 0; j < n; j++) {
-          results[start + j] = get(keys[start + j]);
+          results[start + j] = lookup(keys, longKeys, start + j);
         }
         continue;
       }
@@ -329,7 +420,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       boolean inner = top instanceof Inner;
       while (inner) {
         for (int j = 0; j < n; j++) {
-          children[j] = childOf(nodes[j], keys[start + j]);
+          children[j] = childOf(nodes[j], keys, longKeys, start + j);
         }
         for (int j = 0; j < n; j++) {
           touched += touch(children[j]);
@@ -350,16 +441,16 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         }
       }
       for (int j = 0; j < n; j++) {
-        Object value = valueIn(nodes[j], keys[start + j]);
+        Object value = valueIn(nodes[j], keys, longKeys, start + j);
         if (value == FAILED) {
           nodes[j] = null;
           value = null;
         }
-        results[start + j] = (V) value;
+        results[start + j] = value;
       }
       for (int j = 0; j < n; j++) {
         if (!(nodes[j] instanceof Leaf leaf) || !leaf.validate(versions[j])) {
-          results[start + j] = get(keys[start + j]);
+          results[start + j] = lookup(keys, longKeys, start + j);
         }
       }
     }
@@ -368,15 +459,26 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     }
   }
 
-  /** Gives the child of an inner node for {@code key}, or {@code null} if the read failed. */
-  private Node childOf(Node node, K key) {
+  /** Looks up key {@code i} of a batch alone. */
+  private Object lookup(Object[] keys, long[] longKeys, int i) {
+    return keys != null ? get(keys[i]) : getLong(longKeys[i]);
+  }
+
+  /**
+   * Gives the child of an inner node for key {@code i} of a batch, or {@code null} if the read
+   * failed.
+   */
+  @SuppressWarnings("unchecked")
+  private Node childOf(Node node, Object[] keys, long[] longKeys, int i) {
     if (!(node instanceof Inner inner)) {
       return null;
     }
     try {
-      return inner.children[childIndex(inner, key)];
+      int child =
+          keys != null ? childIndex(inner, (K) keys[i]) : childIndexLong(inner, longKeys[i]);
+      return inner.children[child];
     } catch (RuntimeException e) {
-      // get repeats the read, and throws if the exception was not a stale read.
+      // The lookup alone repeats the read, and throws if the exception was not a stale read.
       return null;
     }
   }
@@ -394,15 +496,17 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   private static final Object FAILED = new Object();
 
   /**
-   * Reads the value of {@code key} in a leaf. Gives {@link #FAILED} if the read threw: the lane
-   * then falls back to {@link #get}, which throws if the exception was not a stale read.
+   * Reads the value of key {@code i} of a batch in a leaf. Gives {@link #FAILED} if the read
+   * threw: the lane then falls back to the lookup alone, which throws if the exception was not a
+   * stale read.
    */
-  private Object valueIn(Node node, K key) {
+  @SuppressWarnings("unchecked")
+  private Object valueIn(Node node, Object[] keys, long[] longKeys, int i) {
     if (!(node instanceof Leaf leaf)) {
       return null;
     }
     try {
-      int pos = find(leaf, key);
+      int pos = keys != null ? find(leaf, (K) keys[i]) : findLong(leaf, longKeys[i]);
       return pos >= 0 ? leaf.values[pos] : null;
     } catch (RuntimeException e) {
       return FAILED;
@@ -1545,6 +1649,11 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       h++;
     }
     return h;
+  }
+
+  /** Gives the root, for analysis tools in this package. */
+  Node rootNode() {
+    return root;
   }
 
   /** Gives the number of leaves in the leaf chain. */

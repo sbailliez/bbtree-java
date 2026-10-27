@@ -18,6 +18,10 @@ import org.openjdk.jmh.annotations.Warmup;
 /**
  * One node search with the windows in the L1 cache: the scalar scan against the two vector
  * scans. It is in the package of the map because the scans are package-private.
+ *
+ * <p>The 256 nodes stay in the cache, but each search takes a random node and a random target
+ * from 65,536 pairs. Thus the branch predictor cannot learn where a scan stops, as in a real
+ * lookup.
  */
 @State(Scope.Thread)
 @BenchmarkMode(Mode.AverageTime)
@@ -28,6 +32,7 @@ import org.openjdk.jmh.annotations.Warmup;
 public class NodeSearchBenchmark {
 
   private static final int NODES = 256;
+  private static final int SEARCHES = 1 << 16;
 
   @Param({"scalar", "vector-count", "vector-scan"})
   public String scan;
@@ -38,6 +43,7 @@ public class NodeSearchBenchmark {
   private WindowScan windowScan;
   private long[][] windows;
   private long[] targets;
+  private int[] order;
   private int next;
 
   @Setup
@@ -51,7 +57,12 @@ public class NodeSearchBenchmark {
         };
     SplittableRandom random = new SplittableRandom(9);
     windows = new long[NODES][];
-    targets = new long[NODES];
+    targets = new long[SEARCHES];
+    order = new int[SEARCHES];
+    for (int i = 0; i < SEARCHES; i++) {
+      targets[i] = random.nextLong();
+      order[i] = random.nextInt(NODES);
+    }
     for (int i = 0; i < NODES; i++) {
       long[] w = new long[n];
       for (int j = 0; j < n; j++) {
@@ -59,14 +70,13 @@ public class NodeSearchBenchmark {
       }
       Arrays.sort(w);
       windows[i] = w;
-      targets[i] = random.nextLong();
     }
   }
 
   @Benchmark
   public long search() {
     int i = next;
-    next = (i + 1) & (NODES - 1);
-    return windowScan.scan(windows[i], n, targets[i]);
+    next = (i + 1) & (SEARCHES - 1);
+    return windowScan.scan(windows[order[i]], n, targets[i]);
   }
 }

@@ -34,6 +34,17 @@ map.forEachInRange(0L, 100L, (k, v) -> System.out.println(k + "=" + v));
 BBTreeMap<String, String> reversed = new BBTreeMap<>(Comparator.reverseOrder());
 ```
 
+For `long` keys, `LongBBTreeMap` takes primitive keys. A lookup with a primitive key reads no
+key object, so it saves the cache miss of the boxed `Long`:
+
+```java
+LongBBTreeMap<String> ids = new LongBBTreeMap<>();
+ids.put(42, "answer");
+ids.get(42);                                   // "answer"
+ids.getMany(new long[] {1, 42}, new String[2]);
+ids.asMap();                                   // the same entries as a BBTreeMap<Long, String>
+```
+
 The built-in inline keys are `LONG`, `INTEGER`, `UUID`, `STRING`, and `BYTES` (`byte[]` in
 unsigned order). For a key type of your own, implement `InlineKey`. Its Javadoc gives the
 contract, and `InlineKeyContractTest` gives a check that you can copy.
@@ -77,8 +88,9 @@ instructions, then the cache coherence traffic. Each item below decreases one of
 
 ## Differences from the Rust bbtree
 
-- No SIMD in the core. The module `bbtree-vector` has a Vector API search, but it is not faster
-  on the machine of the measurements (see below).
+- No SIMD in the core, because the Vector API is an incubator module. The module `bbtree-vector`
+  has a Vector API search, which made `get` 4% to 17% faster on the machine of the measurements
+  (see below).
 - Removal removes empty nodes only. An empty leaf merges with a sibling, an empty inner node gives
   its child to a sibling (or takes one from a full sibling), and a root with one child gives its
   place to the child. A map that becomes empty goes back to one leaf. The Rust bbtree also
@@ -94,8 +106,6 @@ These changes were measured or estimated in a review, but they are not done:
 - **A node layout with fewer objects.** A lookup level reads the node object, then its `long[]`
   of windows, then its `children` array: three dependent loads, where the Rust page has two.
   Estimated gain: 20% to 30% of `get`. It needs a rewrite without the `Node` classes.
-- **A primitive `long` API.** Every lookup first reads its boxed `Long` key, which is a cache miss
-  of its own. A run with the key objects in sequence was 50 to 95 ns faster per lookup.
 - **Hash tags, a prefix for the whole tree, and 2-byte windows**, as in the Rust bbtree.
 
 ## Tests
@@ -128,6 +138,8 @@ java -jar bbtree-benchmarks/target/benchmarks.jar ConcurrentBenchmark -t 16
 | `PutBenchmark` | The build of a map of 1M keys, as time per insert. |
 | `ScanBenchmark` | 100 entries after a random key. |
 | `ConcurrentBenchmark` | Throughput of shared lookups, and of 90% lookups with 10% puts. |
+| `LongKeyBenchmark` | Lookups of `long` keys as spread `Long` objects, as boxed `long` values, and with `LongBBTreeMap`. |
+| `WindowWidthBenchmark` | One node search over windows of 8, 4 or 2 bytes, scalar and vector, in the cache and out of it. |
 | `NodeSearchBenchmark` | One node search with the windows in the L1 cache: the scalar scan and the two vector scans. |
 
 The `impl` values are `bbtree`, `bbtree-vector-scan`, `bbtree-vector-count`, `bbtree-noinline`,
@@ -137,51 +149,65 @@ The `impl` values are `bbtree`, `bbtree-vector-scan`, `bbtree-vector-count`, `bb
 
 ### Results
 
-Apple M5 Pro (18 cores), Corretto 25.0.4, 8 GB heap, 1M keys, 1 JMH fork. The machine also ran
-a browser and other JVMs, at a load average between 4 and 20. Thus the error of a cell is often
-10% to 50%. Run the benchmarks on a quiet machine before you depend on a number.
+Apple M5 Pro (6 performance and 12 efficiency cores), Corretto 25.0.4, 8 GB heap, 1M keys. The
+machine also ran other builds, at a load average between 6 and 10, and 25 at the end. macOS can
+move a benchmark thread to an efficiency core when the machine is busy. Thus the error of a cell
+is often 10% to 50%, and two runs can differ by 30%. Compare the maps within one table, and run
+the benchmarks on a quiet machine before you depend on a number.
 
 Lookups on one thread, half of them misses, in ns per lookup (less is better). For bbtree, the
 number in parentheses is `getMany` with 64 keys a call, per key. For the other maps, a batch is
-64 calls to `get`, which gives the same speed as single lookups.
+64 calls to `get`. The lookup keys are `Long`, `UUID` and `String` objects spread in memory.
 
 | Keys | bbtree | bbtree, no inline keys | TreeMap | ConcurrentSkipListMap |
 |---|--:|--:|--:|--:|
-| `long` | 215 (91) | 360 (231) | 712 | 1,297 |
-| `uuid4` | 212 (112) | 342 (243) | 694 | 1,215 |
-| `uuid7` | 171 (91) | 190 (162) | 351 | 341 |
-| `string` | 266 (163) | 601 (632) | 939 | 1,640 |
+| `long` | 286 (116) | 476 (288) | 881 | 1,910 |
+| `uuid4` | 320 (131) | 496 (284) | 1,142 | 2,023 |
+| `uuid7` | 247 (108) | 263 (196) | 444 | 583 |
+| `string` | 440 (183) | 815 (712) | 1,239 | 2,545 |
+
+`long` lookups, by the form of the key, in ns per lookup (`LongKeyBenchmark`, 2 forks):
+
+| Key form | bbtree | TreeMap | ConcurrentSkipListMap |
+|---|--:|--:|--:|
+| `Long` objects spread in memory | 291 | 883 | 1,745 |
+| `long` values, boxed for the call | 129 | 780 | 2,671 |
+| `long` values with `LongBBTreeMap` | 136 | - | - |
+
+A spread `Long` costs a cache miss before the search starts. A freshly boxed `Long` is in the
+cache, so autoboxing is as fast as the primitive API here. `LongBBTreeMap` allocates nothing, and
+its batch call takes a `long[]`.
 
 The build of a map of 1M keys on one thread, in ns per insert:
 
 | Keys | bbtree | bbtree, no inline keys | TreeMap | ConcurrentSkipListMap |
 |---|--:|--:|--:|--:|
-| `long` | 124 | 278 | 428 | 883 |
-| `uuid4` | 129 | 433 | 549 | 1,104 |
-| `uuid7` | 50 | 39 | 61 | 96 |
-| `string` | 197 | 539 | 935 | 1,456 |
+| `long` | 187 | 277 | 601 | 728 |
+| `uuid4` | 177 | 493 | 711 | 1,039 |
+| `uuid7` | 58 | 39 | 63 | 95 |
+| `string` | 289 | 606 | 896 | 1,346 |
 
 A scan of 100 entries on one thread, in ns per scan:
 
 | Keys | bbtree | TreeMap | ConcurrentSkipListMap |
 |---|--:|--:|--:|
-| `long` | 698 | 6,542 | 5,957 |
-| `uuid4` | 681 | 6,514 | 6,102 |
-| `string` | 715 | 6,760 | 6,443 |
+| `long` | 735 | 6,967 | 6,999 |
+| `uuid4` | 707 | 7,546 | 8,269 |
+| `string` | 793 | 8,548 | 12,629 |
 
 16 threads that share one map, in million operations per second (more is better):
 
 | Keys | Workload | bbtree | ConcurrentSkipListMap | TreeMap with a read-write lock |
 |---|---|--:|--:|--:|
-| `long` | lookups | 44.3 | 7.0 | 4.2 |
-| `long` | 90% lookups, 10% puts | 43.5 | 7.7 | 0.9 |
-| `uuid4` | lookups | 40.2 | 6.5 | 4.3 |
-| `uuid4` | 90% lookups, 10% puts | 40.0 | 8.3 | 0.8 |
-| `string` | lookups | 31.2 | 6.1 | 4.7 |
-| `string` | 90% lookups, 10% puts | 31.2 | 5.2 | 1.1 |
+| `long` | lookups | 46.5 | 8.9 | 4.4 |
+| `long` | 90% lookups, 10% puts | 45.0 | 8.3 | 0.8 |
+| `uuid4` | lookups | 42.5 | 9.4 | 4.5 |
+| `uuid4` | 90% lookups, 10% puts | 34.1 | 9.5 | 1.0 |
+| `string` | lookups | 26.7 | 7.3 | 4.7 |
+| `string` | 90% lookups, 10% puts | 29.8 | 6.1 | 0.9 |
 
-On one thread, the same workloads give bbtree 2.7 to 3.7, the skip list 0.4 to 0.7, and the
-locked TreeMap 0.8 to 1.1 million operations per second.
+On one thread, the same workloads give bbtree 2.0 to 2.6, the skip list 0.4 to 0.6, and the
+locked TreeMap 0.8 to 1.0 million operations per second.
 
 ## The Vector API variant
 
@@ -199,43 +225,34 @@ It has two modes:
 - `SCAN` compares one register of windows at a time, and stops at the first window that is not
   smaller than the target.
 
-**Result: on this machine, the Vector API does not make bbtree faster. Use the scalar map.**
+**Result: on this machine, the vector `COUNT` makes a single `get` 4% to 17% faster. It does not
+help `getMany`, and inserts showed no consistent difference in two runs.** The gain does not come
+from wide compares: a `LongVector` holds only 2 windows. It comes from the count with no branch.
+The scalar scan stops at a random place in each node, and the CPU mispredicts that exit branch
+once on each level.
 
-One node search with the windows in the L1 cache (`NodeSearchBenchmark`), in ns:
+`get` on 1M keys, in ns, median of 3 rounds that alternate the two maps (load average 8 to 20):
+
+| Keys | Scalar | Vector `COUNT` |
+|---|--:|--:|
+| `long` | 284 | 273 |
+| `uuid4` | 299 | 252 |
+| `string` | 387 | 323 |
+
+`getMany` per key was equal within 3%, or 9% slower for `string`.
+
+One node search with the windows in the L1 cache, a random node and a random target each time
+(`NodeSearchBenchmark`), in ns:
 
 | Windows in the node | Scalar scan | Vector `SCAN` | Vector `COUNT` |
 |--:|--:|--:|--:|
-| 16 | 2.5 | 2.9 | 4.1 |
-| 32 | 3.3 | 3.5 | 7.0 |
-| 64 | 5.6 | 4.9 | 12.9 |
+| 16 | 7.4 | 8.3 | 4.8 |
+| 32 | 9.6 | 8.4 | 7.7 |
+| 64 | 12.9 | 11.3 | 14.1 |
 
-The full map, 1M keys, in ns per operation:
-
-| Keys | Operation | Scalar | Vector `SCAN` | Vector `COUNT` |
-|---|---|--:|--:|--:|
-| `long` | `get` | 215 | 204 | 187 |
-| `uuid4` | `get` | 212 | 200 | 202 |
-| `string` | `get` | 266 | 255 | 245 |
-| `long` | `getMany`, per key | 91 | 103 | 99 |
-| `string` | `getMany`, per key | 163 | 165 | 169 |
-| `long` | insert | 124 | 145 | 143 |
-| `uuid4` | insert | 129 | 151 | 159 |
-| `string` | insert | 197 | 235 | 260 |
-
-The `get` differences are smaller than the error of the cells, which was ±16 to ±68 ns. The
-inserts were 15% to 30% slower in every row.
-
-Why:
-
-- On Apple silicon, the preferred vector has 128 bits (NEON), so a `LongVector` holds only 2
-  windows. The Rust bbtree gets its gain from narrow windows: with 2-byte windows, one AVX-512
-  compare covers 32 keys.
-- A node search costs 3 to 6 ns when the node is in the cache. A lookup in a map of 1M keys
-  costs approximately 200 ns, and the cache misses take most of it. A faster compare changes
-  little.
-- A vector path needs windows of 2 or 4 bytes to help. In Java, a tie of a narrow window reads
-  the key object from the heap, which is the cost that the windows avoid. This port keeps
-  8-byte windows for that reason.
+The Vector API is an incubator module, so the core keeps the scalar scan. A larger gain needs
+narrower windows in inner nodes. [docs/vector-apple-silicon.md](docs/vector-apple-silicon.md)
+reviews the best vector design for Apple silicon, with measurements.
 
 On a CPU with 512-bit vectors (AVX-512, 8 `long` lanes), the result can be different. Run
 `NodeSearchBenchmark` and `GetBenchmark` with `-p impl=bbtree,bbtree-vector-scan,bbtree-vector-count`
