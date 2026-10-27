@@ -8,15 +8,25 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 jar="$root/bbtree-benchmarks/target/benchmarks.jar"
 rounds="${1:-6}"
-cache="${BBTREE_BENCH_CACHE:-/tmp/bbtree-cross-language}"
+# A directory of the current user, not a shared one such as /tmp, because the script runs the
+# programs that it finds there.
+cache="${BBTREE_BENCH_CACHE:-$HOME/.cache/bbtree-cross-language}"
 go_revision=262b0b294d30c16d1b0fe00a02d9dd0312bc9000
-mkdir -p "$cache"
+mkdir -p -m 700 "$cache"
+if [[ ! -O "$cache" ]] || [[ -n "$(find "$cache" -maxdepth 0 -perm -g+w -o -maxdepth 0 -perm -o+w)" ]]; then
+  echo "$cache must belong to you, and other users must not write to it" >&2
+  exit 1
+fi
 if [[ ! -d "$cache/bbtree-go/.git" ]]; then
   git clone --quiet https://github.com/richardartoul/bbtree-go "$cache/bbtree-go"
 fi
 git -C "$cache/bbtree-go" checkout --quiet "$go_revision"
-# The script of bbtree-go builds its Go binary and the Rust reference at a pinned revision of the
-# Rust bbtree. A short run builds them.
+if [[ "$(git -C "$cache/bbtree-go" rev-parse HEAD)" != "$go_revision" ]]; then
+  echo "bbtree-go is not at $go_revision" >&2
+  exit 1
+fi
+# The script of bbtree-go builds its Go binary and the Rust reference again on each run, at a
+# pinned revision of the Rust bbtree. A short run builds them.
 BBTREE_BENCH_CACHE="$cache" bash "$cache/bbtree-go/bench/run.sh" -n 64 -queries 64 > /dev/null
 
 cases=(
