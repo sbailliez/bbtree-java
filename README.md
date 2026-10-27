@@ -299,16 +299,18 @@ operation in ns:
   `GetBenchmark` looks up spread keys. `PutBenchmark` inserts the keys in allocation order. On
   maps that fit in the cache (10,000 and 100,000 keys), the vector `get` was 13 ns slower. Thus
   the vector count wins when the lookup waits for memory, and the scalar scan wins when the key
-  and the nodes are in the cache. A probable reason is that the scalar scan branches on each
-  compare: when the key arrives late, the CPU runs ahead on predicted branches and throws away
-  that work. The count has no such branch. This reason is not proven with hardware counters.
+  and the nodes are in the cache. [docs/node-search-cpus.md](docs/node-search-cpus.md) measures
+  the cause with hardware counters, and compares five node searches on four CPUs: Apple M5,
+  Graviton3, AMD Zen 5 and Intel Sapphire Rapids. The scalar scan is the fastest or within 5% on
+  all four for inserts. It also has the smallest worst case: at most 25% slower than the fastest
+  search, for absent keys on the M5. Each of the other searches is 28% to 47% slower somewhere.
   The insert path has no other cause: the vector maps allocate the same 38.5 bytes per insert,
   and larger C2 inlining limits do not change the times.
 
 [docs/vector-apple-silicon.md](docs/vector-apple-silicon.md) gives the review of the vector design
-for Apple silicon, with the node search measurements. On a CPU with 512-bit vectors (AVX-512), the
-result can be different. Run `GetBenchmark` with
-`-p impl=bbtree,bbtree-vector-count-wide,bbtree-vector-count` on that machine before you choose.
+for Apple silicon, with the node search measurements. With AVX-512, the vector count was also
+slower than the scalar scan in every mode, on AMD Zen 5 and on Intel Sapphire Rapids. The vector
+`SCAN` mode was 8% to 9% faster for cold lookups on Zen 5 only.
 
 ## Java, Go and Rust
 

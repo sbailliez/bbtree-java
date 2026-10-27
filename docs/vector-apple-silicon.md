@@ -234,8 +234,10 @@ Two results of the implementation differ from the recommendation:
   - Leaves of 16 entries, whose windows take one cache line, keep the same extra time.
   - The vector maps allocate the same 38.5 bytes per insert as the scalar map, so C2 does not
     make vector objects. Larger C2 inlining limits do not change the times.
-  - A probable reason is the cost of a branch that the CPU predicts before the key arrives. It is
-    not proven with hardware counters.
+  - [node-search-cpus.md](node-search-cpus.md) measures the cause with hardware counters on
+    Graviton3, AMD Zen 5 and Intel Sapphire Rapids. The vector count executes 185 to 230 more
+    instructions per lookup than the scalar scan, and the mispredicts that it removes do not limit
+    the lookup on these three CPUs.
 
 ## How to run the measurements
 
