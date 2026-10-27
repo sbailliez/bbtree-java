@@ -72,6 +72,111 @@ The built-in inline keys are `LONG`, `INTEGER`, `UUID`, `STRING`, and `BYTES` (`
 unsigned order). For a key type of your own, implement `InlineKey`. Its Javadoc gives the
 contract, and `InlineKeyContractTest` gives a check that you can copy.
 
+## Which map to use
+
+The Rust bbtree keeps each key and each value by value in its node pages. A Java map of any key
+type keeps references: to a key object, to a value object, and to the arrays of each node. Each
+reference that a lookup follows can be a cache miss. The kinds of map below remove these objects
+one step at a time. `BBTrees` makes each kind, and its Javadoc gives the same trade-offs.
+
+| Factory method | Class | Keys | Values | What a lookup reads | `Map` view |
+|---|---|---|---|---|---|
+| `BBTrees.naturalOrder()`, `BBTrees.ordered(comparator)` | `BBTreeMap` | any | any | key objects in each node | yes |
+| `BBTrees.inline(InlineKey)` | `BBTreeMap` | with an encoding: `long`, `int`, `UUID`, `String`, `byte[]`, your own | any | windows; a key object only on a tie | yes |
+| `BBTrees.longKeys()` | `LongBBTreeMap` | `long` | any | windows, then the value object | `asMap()` |
+| `BBTrees.longToLong()` | `LongLongBBTreeMap` | `long` | `long` | windows, then a `long[]` of values | `asMap()` |
+| `BBTrees.packed()` | `PackedLongMap` | `long` | `long` | one `long[]` per node with the keys and the values | no |
+| `VectorBBTreeMaps.create(...)` (module bbtree-vector) | `BBTreeMap` | as `inline` | any | as `inline`, with a Vector API search | yes |
+
+Measured differences, with 1M entries:
+
+- `inline` against `naturalOrder`: `get` of `long` keys took 286 ns against 476 ns on the Apple
+  M5 (`GetBenchmark`, the results below).
+- `longToLong` against `longKeys` with `Long` values, with the workloads of the Java, Go and Rust
+  comparison on Graviton3, AMD Zen 5 and Intel Sapphire Rapids: `uint64` hits 23% to 40% faster,
+  batch lookups 18% to 31% faster, scans of 64 entries 58% to 67% faster.
+- `packed` against `longToLong`, with the same workloads and machines: hits 25% to 48% faster,
+  inserts 22% to 40% faster, scans 15% to 50% faster, batch lookups between 7% slower and 22%
+  faster.
+- The vector maps were slower than the scalar maps on Graviton3, Zen 5 and Sapphire Rapids
+  ([docs/node-search-cpus.md](docs/node-search-cpus.md)), and faster for cold lookups on the
+  Apple M5.
+
+The costs of each step:
+
+- `BBTreeMap` takes any key and value type and is a full `ConcurrentMap`.
+- `LongBBTreeMap` and `LongLongBBTreeMap` keep a `Long` object for each key, for the separators
+  and the `Map` view, so their memory per entry is larger than that of `packed`.
+- `PackedLongMap` takes only `long` keys and `long` values, has no `Map` view, and does not merge
+  nodes: a removal leaves an empty leaf in the tree.
+
+### Use cases
+
+**bbtree in general** fits a sorted map that many threads read and write at the same time, and
+that needs ordered access: ranges, the next key, scans in key order. Use it in place of a
+`ConcurrentSkipListMap`, or of a `TreeMap` behind a lock. On the M5 (the results below), `get`
+was 1.8 to 3.6 times faster than `TreeMap`, and 4.1 to 8.7 times faster with `getMany`. Scans of
+100 entries were 9 to 11 times faster, and 16 threads did 27 to 47 million operations per second
+against 6 to 9.5 million for `ConcurrentSkipListMap`.
+
+Examples:
+
+- **An in-memory index with range queries.** A service keeps its records in memory, keyed by a
+  sortable value such as a name, a path or a URL, and answers queries such as "all entries from
+  `a` to `b`" or "the 50 entries after this cursor". Request threads read the index while a
+  loader thread adds and updates records. A `HashMap` cannot answer a range, and a
+  `ConcurrentSkipListMap` follows one pointer for each key that it compares. Use
+  `BBTrees.inline(InlineKey.STRING)`, and `forEachInRange` or `iterator` for the ranges.
+- **A secondary index of a database or a cache.** The primary data is keyed by ID, and the index
+  maps another attribute to the IDs, for example the email of a user to the user ID, or a
+  composite of a tenant ID and a creation time to an order ID. The index must find one key fast
+  and must also list all keys of one tenant in order. Encode the composite key as a `byte[]` and
+  use `BBTrees.inline(InlineKey.BYTES)`, or give a `Comparator` to `BBTrees.ordered` if the key
+  has no simple encoding.
+- **A time-ordered index of events.** Events arrive with a timestamp or a sequence number, and
+  readers ask for "the events after time t" or "the first event at or after t". The keys arrive almost
+  in ascending order, which the append split handles: the leaves stay almost full. With `long`
+  keys and an offset or a position as the value, for example the offset of the event in a log
+  file, use `BBTrees.packed()`. With UUID v7 keys and event objects as values, use
+  `BBTrees.inline(InlineKey.UUID)`.
+- **An order book.** A trading engine keeps, for each price level, the quantity that is offered.
+  It must find the best price, walk the levels in price order, and change quantities while other
+  threads read the book. The maps iterate in ascending order only, so keep the bids with the
+  price negated, so that the best bid is the first key. With the price as a `long` number of ticks
+  and the quantity as a `long`,
+  use `BBTrees.packed()` for the speed, or `BBTrees.longToLong()` when a level must be removed
+  when its quantity becomes 0, because `PackedLongMap` leaves an empty leaf after removals.
+- **A map that many threads share.** Any sorted map that one lock protects today, for example
+  sessions sorted by expiry time that a cleaner thread scans, while request threads add and touch
+  sessions, with the expiry time and the session ID as a composite key. A write locks only the
+  leaf that it changes, plus the parent when the leaf splits, and a read takes no lock.
+
+A sorted map is not the best choice when:
+
+- the map needs no order: a `HashMap` or a `ConcurrentHashMap` does not compare keys at all;
+- the map is small and only one thread uses it: a `TreeMap` stays in the cache;
+- the workload removes most of its keys: this port merges only empty nodes (`BBTreeMap`), or no
+  nodes (`PackedLongMap`), so a map that shrinks keeps sparse nodes.
+
+**Each kind:**
+
+- `BBTrees.naturalOrder()` and `BBTrees.ordered(comparator)`: keys that have no order-preserving
+  encoding, for example a composite key with a custom `Comparator`. It is still faster than a
+  `ConcurrentSkipListMap` (476 ns against 1,910 ns for `long` lookups on the M5).
+- `BBTrees.inline(InlineKey)`: the general choice for keys with an encoding: `UUID` primary keys,
+  URLs and paths, `byte[]` keys of a storage engine, `int` and `long` keys with object values when
+  a `Map<K, V>` API is necessary. Time-ordered keys, such as UUID v7, fill the leaves with the
+  append split.
+- `BBTrees.longKeys()`: `long` IDs or timestamps that map to objects, when the caller has the key
+  as a primitive `long`. It avoids the boxing and the cache miss of a `Long` key.
+- `BBTrees.longToLong()`: `long` to `long` maps that also need a `Map<Long, Long>` view or full
+  removal semantics: counters, offsets, an ID to an ID.
+- `BBTrees.packed()`: the fastest `long` to `long` index, where the map only grows or changes
+  values: a timestamp to a file offset, a sequence number to a position, a price level to a
+  quantity. It has no `Map` view, and removals leave empty leaves.
+- `VectorBBTreeMaps` (module bbtree-vector): experiments with the Java Vector API. On the CPUs of
+  the measurements, it was faster only for lookups of cold keys on Apple silicon.
+
 ## How it works
 
 The post on bbtree ranks the costs of a lookup: first the cache misses, then the
@@ -160,6 +265,8 @@ measurements of this port:
 | `BBTreeMapTest` | Unit tests: ranges, iterators, `getMany`, compaction, ascending loads, and exceptions from user code, which must leave no lock held. |
 | `ConcurrencyTest` | Readers, iterators, and batch lookups run while writers split nodes and empty whole subtrees. Steady keys must never disappear. Also atomic `merge` and single removal. |
 | `LongBBTreeMapTest`, `LongLongBBTreeMapTest` | The primitive APIs against a `TreeMap`, with keys at every prefix length and at `Long.MIN_VALUE` and `Long.MAX_VALUE`, and scans while writers split and empty leaves. |
+| `PackedLongMapTest` | `PackedLongMap` against a `TreeMap` with the same key sources, an ascending load, and lookups of steady keys while writers split leaves everywhere. |
+| `BBTreesTest` | Each factory method makes a working map. |
 | `GuavaMapContractTest` | The `ConcurrentMap` contract suites of guava-testlib, for 3 configurations. |
 
 Small nodes (4 entries) in most tests make splits and leaf removals frequent.
@@ -365,21 +472,26 @@ the time of Rust:
 | Machine | Inserts and deletes | Lookups and scans |
 |---|--:|--:|
 | Apple M5 Pro | 0.90 to 2.04 | 1.70 to 5.71 |
-| Graviton3 (c7g.4xlarge) | 0.72 to 1.73 | 0.84 to 3.65 |
-| AMD Zen 5 (c8a.4xlarge) | 0.77 to 2.53 | 0.67 to 5.98 |
-| Intel Sapphire Rapids (c7i.4xlarge) | 0.91 to 3.04 | 0.87 to 6.82 |
+| Graviton3 (c7g.4xlarge) | 0.61 to 1.26 | 0.69 to 2.36 |
+| AMD Zen 5 (c8a.4xlarge) | 0.73 to 1.27 | 0.66 to 3.51 |
+| Intel Sapphire Rapids (c7i.4xlarge) | 0.63 to 1.52 | 0.82 to 4.19 |
+
+The M5 ran before `PackedLongMap` existed. On the three EC2 machines the fastest Java map for
+`uint64` keys is `PackedLongMap`.
 
 Differences in the workload:
 
-- Java has one map type, which is concurrent. In the `single` rows it runs on one thread, where
-  Rust uses its single-thread map and Go its `Map`.
-- Java values are `Long` objects. A hit reads the value object, where Go and Rust read a `u64`
-  in the leaf.
-- The Java scan uses the entry iterator, which makes one entry object for each entry.
+- Java has no single-thread map. In the `single` rows the concurrent maps run on one thread,
+  where Rust uses its single-thread map and Go its `Map`.
+- The `string` values in Java are `Long` objects. A hit reads the value object, where Go and Rust
+  read a `u64` in the leaf. The `uint64` maps keep primitive values.
+- `PackedLongMap` does not merge nodes, so its deletes do less work than the others.
 
-With 8 threads, Java inserts are at most 9% slower than Rust on all four machines, and 1.5 to 5.6
-times faster than Go. Lookups of `uint64` keys take 1.6 to 6.8 times the Rust time. On the M5, a
-large part of the gap comes from cache misses. At 65,536 entries, which stay in the cache, a
+With 8 threads, Java inserts were faster than Rust on the three EC2 machines (0.61 to 0.87 times
+the Rust time), and 3.7 to 5.9 times faster than Go. With `PackedLongMap`, `uint64` hits took 1.05
+times the Rust time on Graviton3 and 1.26 to 2.79 times on Zen 5 and Sapphire Rapids. Batch
+lookups stay the largest gap: 1.72 to 3.96 times. On the M5, a large part of the gap of the other
+maps comes from cache misses. At 65,536 entries, which stay in the cache, a
 `uint64` hit took 50 ns in Java and 21 ns in Rust.
 At 1M entries, it took 168 ns and 39 ns. The larger map thus added 118 ns in Java and 18 ns in
 Rust. A Java lookup reads more separate objects on each level: the node, its windows array and
