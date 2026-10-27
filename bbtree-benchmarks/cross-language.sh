@@ -12,6 +12,9 @@
 #                                 prints the CSV. Put jump hosts in ~/.ssh/config or in SSH_OPTS.
 #   table <csv>                   Prints the median of each case as a Markdown table.
 #
+# JAVA_OPTS adds JVM flags to the Java runs. The default has none, so that Java uses 4 KB pages as
+# Go and Rust do. On Linux, JAVA_OPTS=-XX:+UseTransparentHugePages gives Java 2 MB pages.
+#
 # Example on this machine:   cross-language.sh prepare ~/.cache/bbtree-cross
 #                            cross-language.sh run ~/.cache/bbtree-cross 6 > m5.csv
 # Example on an EC2 host:    cross-language.sh remote ec2-user@10.0.0.5 ~/.cache/bbtree-cross > c7g.csv
@@ -95,7 +98,8 @@ run() {
         "$dir/reference/target/release/bbtree-reference" "${args[@]}" | sed "s/^/$round,/"
         for impl in scalar vector; do
           # The last of 5 repetitions in one JVM, after the JIT warm-up.
-          java -Xms8g -Xmx8g --add-modules=jdk.incubator.vector -cp "$dir/benchmarks.jar" \
+          # shellcheck disable=SC2086
+          java -Xms8g -Xmx8g ${JAVA_OPTS:-} --add-modules=jdk.incubator.vector -cp "$dir/benchmarks.jar" \
             io.github.sb.bbtree.bench.CrossLanguage "${args[@]}" -impl "$impl" -repeat 5 2> /dev/null \
             | grep -v '^Picked' | tail -1 | sed "s/^/$round,/"
         done
@@ -156,7 +160,7 @@ case "$command" in
   remote) remote "$2" "$3" "${4:-6}" ;;
   table) table "$2" ;;
   *)
-    sed -n '2,22p' "${BASH_SOURCE[0]}" >&2
+    sed -n '2,23p' "${BASH_SOURCE[0]}" >&2
     exit 1
     ;;
 esac

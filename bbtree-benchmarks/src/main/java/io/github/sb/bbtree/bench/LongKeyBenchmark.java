@@ -38,7 +38,7 @@ import org.openjdk.jmh.infra.Blackhole;
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 @Warmup(iterations = 3, time = 1)
 @Measurement(iterations = 5, time = 1)
-@Fork(value = 2, jvmArgsAppend = {"-Xms8g", "-Xmx8g", "-XX:+AlwaysPreTouch"})
+@Fork(value = 2, jvmArgsAppend = {"-XX:+IgnoreUnrecognizedVMOptions", "-XX:+UseTransparentHugePages", "-Xms8g", "-Xmx8g", "-XX:+AlwaysPreTouch"})
 public class LongKeyBenchmark {
 
   private static final int BATCH = 64;

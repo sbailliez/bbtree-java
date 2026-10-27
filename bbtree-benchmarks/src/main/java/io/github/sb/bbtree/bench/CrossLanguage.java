@@ -2,12 +2,11 @@ package io.github.sb.bbtree.bench;
 
 import io.github.sb.bbtree.BBTreeMap;
 import io.github.sb.bbtree.InlineKey;
-import io.github.sb.bbtree.LongBBTreeMap;
+import io.github.sb.bbtree.LongLongBBTreeMap;
 import io.github.sb.bbtree.VectorBBTreeMaps;
 import java.util.Arrays;
-import java.util.Iterator;
-import java.util.Map;
 import java.util.concurrent.CyclicBarrier;
+import java.util.function.BiPredicate;
 
 /**
  * The workloads of {@code bench/main.go} in <a
@@ -18,14 +17,15 @@ import java.util.concurrent.CyclicBarrier;
  * <p>The keys, the queries, the values and the checksums are the same as in Go and Rust:
  *
  * <ul>
- *   <li>{@code uint64} keys use {@link LongBBTreeMap}. A key is stored as {@code key ^
+ *   <li>{@code uint64} keys use {@link LongLongBBTreeMap}, with primitive values. A key is stored as {@code key ^
  *       Long.MIN_VALUE}, so that the signed order of Java is the unsigned order of Go and Rust,
  *       and {@code scan64} gives the same entries.
  *   <li>{@code string} keys use {@link BBTreeMap} with {@link InlineKey#STRING}.
  * </ul>
  *
  * <p>Java has one map type, which is concurrent. The {@code single} mode runs it on one thread.
- * The values are {@link Long} objects. A JVM needs warm-up, so the program repeats the whole
+ * The {@code string} values are {@link Long} objects. The scans give each entry to a predicate
+ * that stops after 64 entries, and make no entry object. A JVM needs warm-up, so the program repeats the whole
  * workload {@code -repeat} times with a new map each time, and prints one row for each
  * repetition. Compare the last rows with Go and Rust. The flag {@code -impl} chooses the map:
  * {@code vector} (the default) for the vector count of bbtree-vector, or {@code scalar}.
@@ -225,7 +225,7 @@ public final class CrossLanguage {
     }
   }
 
-  static final class LongWorkload extends Workload<LongBBTreeMap<Long>> {
+  static final class LongWorkload extends Workload<LongLongBBTreeMap> {
     private final long[] keys;
     private final long[] queries;
 
@@ -242,58 +242,76 @@ public final class CrossLanguage {
     }
 
     @Override
-    LongBBTreeMap<Long> newMap() {
+    LongLongBBTreeMap newMap() {
       return o.vector
-          ? VectorBBTreeMaps.createLong(VectorBBTreeMaps.Mode.COUNT)
-          : new LongBBTreeMap<>();
+          ? VectorBBTreeMaps.createLongLong(VectorBBTreeMaps.Mode.COUNT)
+          : new LongLongBBTreeMap();
     }
 
     @Override
-    long put(LongBBTreeMap<Long> map, boolean query, int i, long value) {
-      Long old = map.put(query ? queries[i] : keys[i], value);
-      return old == null ? 0 : old;
+    long put(LongLongBBTreeMap map, boolean query, int i, long value) {
+      return map.put(query ? queries[i] : keys[i], value, 0);
     }
 
     @Override
-    long get(LongBBTreeMap<Long> map, int query) {
-      Long v = map.get(queries[query]);
-      return v == null ? 0 : v;
+    long get(LongLongBBTreeMap map, int query) {
+      return map.get(queries[query], 0);
     }
 
     @Override
-    long remove(LongBBTreeMap<Long> map, int key) {
-      Long v = map.remove(keys[key]);
-      return v == null ? 0 : v;
+    long remove(LongLongBBTreeMap map, int key) {
+      return map.remove(keys[key], 0);
     }
 
     @Override
     Object newBuffers() {
-      return new Object[] {new long[64], new Long[64]};
+      return new long[][] {new long[64], new long[64]};
     }
 
     @Override
-    long getMany(LongBBTreeMap<Long> map, int from, int to, Object buffers) {
-      Object[] b = (Object[]) buffers;
-      long[] batch = (long[]) b[0];
-      Long[] values = (Long[]) b[1];
+    long getMany(LongLongBBTreeMap map, int from, int to, Object buffers) {
+      long[][] b = (long[][]) buffers;
+      long[] batch = b[0];
+      long[] values = b[1];
       int n = to - from;
       if (n != batch.length) {
         batch = Arrays.copyOfRange(queries, from, to);
+        values = new long[n];
       } else {
         System.arraycopy(queries, from, batch, 0, n);
       }
-      map.getMany(batch, values);
+      map.getMany(batch, values, 0);
       long sum = 0;
       for (int i = 0; i < n; i++) {
-        Long v = values[i];
-        sum += v == null ? 0 : v;
+        sum += values[i];
       }
       return sum;
     }
 
     @Override
-    long scan64(LongBBTreeMap<Long> map, int query) {
-      return firstValues(map.asMap(), queries[query]);
+    long scan64(LongLongBBTreeMap map, int query) {
+      FirstValues first = new FirstValues();
+      map.forEachFrom(queries[query], first);
+      return first.sum;
+    }
+  }
+
+  /** Adds the values of the first 64 entries of a scan, with no object for each entry. */
+  static final class FirstValues
+      implements LongLongBBTreeMap.EntryPredicate, BiPredicate<Object, Long> {
+    long sum;
+    int count;
+
+    @Override
+    public boolean test(long key, long value) {
+      sum += value;
+      return ++count < 64;
+    }
+
+    @Override
+    public boolean test(Object key, Long value) {
+      sum += value;
+      return ++count < 64;
     }
   }
 
@@ -371,16 +389,10 @@ public final class CrossLanguage {
 
     @Override
     long scan64(BBTreeMap<String, Long> map, int query) {
-      return firstValues(map, queries[query]);
+      FirstValues first = new FirstValues();
+      map.forEachInRangeWhile(queries[query], null, first);
+      return first.sum;
     }
   }
 
-  private static <K> long firstValues(BBTreeMap<K, Long> map, K from) {
-    long sum = 0;
-    Iterator<Map.Entry<K, Long>> it = map.iterator(from, true, null, false);
-    for (int count = 0; count < 64 && it.hasNext(); count++) {
-      sum += it.next().getValue();
-    }
-    return sum;
-  }
 }

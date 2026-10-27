@@ -344,4 +344,18 @@ class BBTreeMapTest {
     }
     assertEquals(0, inline.compares);
   }
+
+  @Test
+  void forEachInRangeWhileStopsWhenTheActionSaysSo() {
+    BBTreeMap<String, Integer> map = new BBTreeMap<>(InlineKey.STRING, 4, 4);
+    for (int i = 0; i < 1_000; i++) {
+      map.put(String.format("k%04d", i), i);
+    }
+    List<Integer> seen = new ArrayList<>();
+    map.forEachInRangeWhile("k0100", "k0200", (k, v) -> seen.add(v) && seen.size() < 10);
+    assertEquals(List.of(100, 101, 102, 103, 104, 105, 106, 107, 108, 109), seen);
+    seen.clear();
+    map.forEachInRangeWhile("k0995", null, (k, v) -> seen.add(v));
+    assertEquals(List.of(995, 996, 997, 998, 999), seen);
+  }
 }

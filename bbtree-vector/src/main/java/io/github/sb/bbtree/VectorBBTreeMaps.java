@@ -70,6 +70,25 @@ public final class VectorBBTreeMaps {
   }
 
   /**
+   * Makes an empty map of primitive {@code long} keys and values with the default node capacities.
+   *
+   * @param mode the vector search
+   * @return the map
+   */
+  public static LongLongBBTreeMap createLongLong(Mode mode) {
+    WindowScan scan = mode == Mode.COUNT ? VectorWindowScan.COUNT : VectorWindowScan.SCAN;
+    return new LongLongBBTreeMap(
+        new BBTreeMap<>(
+            InlineKey.LONG,
+            InlineKey.LONG,
+            BBTreeMap.DEFAULT_LEAF_CAPACITY,
+            BBTreeMap.DEFAULT_INNER_CAPACITY,
+            scan,
+            BBTreeMap.narrowSuits(InlineKey.LONG),
+            true));
+  }
+
+  /**
    * Gives the number of 64-bit lanes in the preferred vector register of this machine.
    *
    * @return the lane count, for example 2 on NEON and 8 on AVX-512

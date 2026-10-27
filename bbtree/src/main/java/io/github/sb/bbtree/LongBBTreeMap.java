@@ -31,6 +31,20 @@ public final class LongBBTreeMap<V> {
     void accept(long key, V value);
   }
 
+  /** Receives the entries of {@link #forEachInRangeWhile} and {@link #forEachFrom}. */
+  @FunctionalInterface
+  public interface EntryPredicate<V> {
+
+    /**
+     * Receives one entry.
+     *
+     * @param key the key
+     * @param value the value
+     * @return {@code false} to stop
+     */
+    boolean test(long key, V value);
+  }
+
   private final BBTreeMap<Long, V> map;
 
   /** Makes an empty map with the default node capacities. */
@@ -119,15 +133,51 @@ public final class LongBBTreeMap<V> {
   }
 
   /**
-   * Gives each entry with a key in {@code [from, to)} to {@code action}, in key order.
+   * Gives each entry with a key in {@code [from, to)} to {@code action}, in key order. The scan
+   * reads no key object.
    *
    * @param from the inclusive lower bound
    * @param to the exclusive upper bound
    * @param action the action
    */
+  @SuppressWarnings("unchecked")
   public void forEachInRange(long from, long to, EntryConsumer<? super V> action) {
     Objects.requireNonNull(action);
-    map.forEachInRange(from, to, (k, v) -> action.accept(k, v));
+    map.scanLong(
+        from,
+        to,
+        false,
+        (k, v, unused) -> {
+          action.accept(k, (V) v);
+          return true;
+        });
+  }
+
+  /**
+   * Gives each entry with a key in {@code [from, to)} to {@code action}, in key order, while the
+   * action returns {@code true}. The scan reads no key object.
+   *
+   * @param from the inclusive lower bound
+   * @param to the exclusive upper bound
+   * @param action the action; it returns {@code false} to stop
+   */
+  @SuppressWarnings("unchecked")
+  public void forEachInRangeWhile(long from, long to, EntryPredicate<? super V> action) {
+    Objects.requireNonNull(action);
+    map.scanLong(from, to, false, (k, v, unused) -> action.test(k, (V) v));
+  }
+
+  /**
+   * Gives each entry with a key equal to or larger than {@code from} to {@code action}, in key
+   * order, while the action returns {@code true}. The scan reads no key object.
+   *
+   * @param from the inclusive lower bound
+   * @param action the action; it returns {@code false} to stop
+   */
+  @SuppressWarnings("unchecked")
+  public void forEachFrom(long from, EntryPredicate<? super V> action) {
+    Objects.requireNonNull(action);
+    map.scanLong(from, Long.MAX_VALUE, true, (k, v, unused) -> action.test(k, (V) v));
   }
 
   /**

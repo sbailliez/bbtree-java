@@ -12,6 +12,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BiConsumer;
+import java.util.function.BiPredicate;
 
 /**
  * A concurrent sorted map: a B+ tree with inline keys and optimistic lock coupling, after
@@ -81,6 +82,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   /** An inner node with 4-byte windows and a prefix of this length or more compares no key. */
   private final int narrowExactFrom;
 
+  /** {@code true} if the leaves keep primitive {@code long} values ({@link Leaf#longValues}). */
+  private final boolean primitiveValues;
+
   /**
    * {@code true} if the inner nodes also keep 4-byte windows ({@link Inner#narrow}). A node with
    * both fences searches them. The root and the nodes on the left and right borders have a prefix
@@ -135,7 +139,6 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     this(comparator, inline, leafCapacity, innerCapacity, WindowScan.SCALAR, false);
   }
 
-  @SuppressWarnings("unchecked")
   BBTreeMap(
       Comparator<? super K> comparator,
       InlineKey<K> inline,
@@ -143,6 +146,21 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       int innerCapacity,
       WindowScan scan,
       boolean narrowInnerWindows) {
+    this(comparator, inline, leafCapacity, innerCapacity, scan, narrowInnerWindows, false);
+  }
+
+  @SuppressWarnings("unchecked")
+  BBTreeMap(
+      Comparator<? super K> comparator,
+      InlineKey<K> inline,
+      int leafCapacity,
+      int innerCapacity,
+      WindowScan scan,
+      boolean narrowInnerWindows,
+      boolean primitiveValues) {
+    if (primitiveValues && inline != InlineKey.LONG) {
+      throw new IllegalArgumentException("primitive values need InlineKey.LONG");
+    }
     if (leafCapacity < MIN_CAPACITY || leafCapacity > MAX_CAPACITY) {
       throw new IllegalArgumentException("leafCapacity out of range: " + leafCapacity);
     }
@@ -157,9 +175,10 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     this.exactFrom = fixed < 0 ? Integer.MAX_VALUE : fixed - Long.BYTES;
     this.narrowExactFrom = fixed < 0 ? Integer.MAX_VALUE : fixed - Integer.BYTES;
     this.narrow = inline != null && narrowInnerWindows;
+    this.primitiveValues = primitiveValues;
     this.leafCapacity = leafCapacity;
     this.innerCapacity = innerCapacity;
-    this.root = new Leaf(leafCapacity, inline != null);
+    this.root = new Leaf(leafCapacity, inline != null, primitiveValues);
   }
 
   /**
@@ -358,7 +377,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         }
         Leaf leaf = (Leaf) node;
         int pos = find(leaf, k);
-        Object value = pos >= 0 ? leaf.values[pos] : null;
+        Object value = pos >= 0 ? valueAt(leaf, pos) : null;
         if (leaf.validate(v)) {
           @SuppressWarnings("unchecked")
           V result = (V) value;
@@ -375,6 +394,11 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   @Override
   public boolean containsKey(Object key) {
     return get(key) != null;
+  }
+
+  /** Gives true if the leaves keep primitive {@code long} values. */
+  boolean hasPrimitiveValues() {
+    return primitiveValues;
   }
 
   /** Gives true if the map uses {@link InlineKey#LONG}, which the primitive methods need. */
@@ -409,9 +433,50 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         }
         Leaf leaf = (Leaf) node;
         int pos = findLong(leaf, key);
-        Object value = pos >= 0 ? leaf.values[pos] : null;
+        Object value = pos >= 0 ? valueAt(leaf, pos) : null;
         if (leaf.validate(v)) {
           return (V) value;
+        }
+      } catch (RuntimeException e) {
+        // A torn read can see a null child during a split.
+        if (node.validate(v)) {
+          throw e;
+        }
+      }
+    }
+  }
+
+  /**
+   * Looks up the primitive value of a primitive key in a map of primitive values. It does the same
+   * descent as {@link #getLong}, and reads the value with no boxing.
+   *
+   * @return the value, or {@code absent} if the map does not have the key
+   */
+  long getLongValue(long key, long absent) {
+    restart:
+    while (true) {
+      Node node = root;
+      long v = node.version();
+      if (Node.isLocked(v) || node != root) {
+        Thread.onSpinWait();
+        continue;
+      }
+      try {
+        while (node instanceof Inner inner) {
+          Node child = inner.children[childIndexLong(inner, key)];
+          long cv = child.version();
+          if (Node.isLocked(cv) || !inner.validate(v)) {
+            Thread.onSpinWait();
+            continue restart;
+          }
+          node = child;
+          v = cv;
+        }
+        Leaf leaf = (Leaf) node;
+        int pos = findLong(leaf, key);
+        long value = pos >= 0 ? leaf.longValues[pos] : absent;
+        if (leaf.validate(v)) {
+          return value;
         }
       } catch (RuntimeException e) {
         // A torn read can see a null child during a split.
@@ -443,7 +508,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     for (K k : keys) {
       Objects.requireNonNull(k);
     }
-    getMany(keys, null, keys.length, results);
+    getMany(keys, null, keys.length, results, null, 0L);
   }
 
   /**
@@ -454,14 +519,32 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     if (results.length < keys.length) {
       throw new IllegalArgumentException("results is shorter than keys");
     }
-    getMany(null, keys, keys.length, results);
+    getMany(null, keys, keys.length, results, null, 0L);
   }
 
   /**
-   * The batch lookup of {@link #getMany} and {@link #getManyLong}. Exactly one of {@code keys}
-   * and {@code longKeys} is not {@code null}.
+   * Looks up many primitive keys in a map of primitive values, as {@link #getMany} does, and
+   * writes the primitive values to {@code results}, or {@code absent} for a missing key.
    */
-  private void getMany(Object[] keys, long[] longKeys, int length, Object[] results) {
+  void getManyLongValues(long[] keys, long[] results, long absent) {
+    if (results.length < keys.length) {
+      throw new IllegalArgumentException("results is shorter than keys");
+    }
+    getMany(null, keys, keys.length, null, results, absent);
+  }
+
+  /**
+   * The batch lookup of {@link #getMany}, {@link #getManyLong} and {@link #getManyLongValues}.
+   * Exactly one of {@code keys} and {@code longKeys} is not {@code null}, and exactly one of
+   * {@code results} and {@code longResults}.
+   */
+  private void getMany(
+      Object[] keys,
+      long[] longKeys,
+      int length,
+      Object[] results,
+      long[] longResults,
+      long absent) {
     int lanes = Math.min(BATCH_LANES, length);
     Node[] nodes = new Node[lanes];
     Node[] children = new Node[lanes];
@@ -480,7 +563,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       long tv = top.version();
       if (Node.isLocked(tv) || top != root) {
         for (int j = 0; j < n; j++) {
-          results[start + j] = lookup(keys, longKeys, start + j);
+          store(results, longResults, start + j, keys, longKeys, absent);
         }
         continue;
       }
@@ -511,16 +594,20 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         }
       }
       for (int j = 0; j < n; j++) {
-        Object value = valueIn(nodes[j], keys, longKeys, start + j);
-        if (value == FAILED) {
+        int pos = positionIn(nodes[j], keys, longKeys, start + j);
+        if (pos == POSITION_FAILED) {
           nodes[j] = null;
-          value = null;
+          pos = -1;
         }
-        results[start + j] = value;
+        if (longResults != null) {
+          longResults[start + j] = pos >= 0 ? ((Leaf) nodes[j]).longValues[pos] : absent;
+        } else {
+          results[start + j] = pos >= 0 ? valueAt((Leaf) nodes[j], pos) : null;
+        }
       }
       for (int j = 0; j < n; j++) {
         if (!(nodes[j] instanceof Leaf leaf) || !leaf.validate(versions[j])) {
-          results[start + j] = lookup(keys, longKeys, start + j);
+          store(results, longResults, start + j, keys, longKeys, absent);
         }
       }
     }
@@ -529,9 +616,14 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     }
   }
 
-  /** Looks up key {@code i} of a batch alone. */
-  private Object lookup(Object[] keys, long[] longKeys, int i) {
-    return keys != null ? get(keys[i]) : getLong(longKeys[i]);
+  /** Looks up key {@code i} of a batch alone, and stores its value at index {@code i}. */
+  private void store(
+      Object[] results, long[] longResults, int i, Object[] keys, long[] longKeys, long absent) {
+    if (longResults != null) {
+      longResults[i] = getLongValue(longKeys[i], absent);
+    } else {
+      results[i] = keys != null ? get(keys[i]) : getLong(longKeys[i]);
+    }
   }
 
   /**
@@ -568,24 +660,23 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     return (node.count & 1) + (w != null ? w[0] & 1 : 0);
   }
 
-  /** The result of {@link #valueIn} when the read threw. */
-  private static final Object FAILED = new Object();
+  /** The result of {@link #positionIn} when the read threw. */
+  private static final int POSITION_FAILED = Integer.MIN_VALUE;
 
   /**
-   * Reads the value of key {@code i} of a batch in a leaf. Gives {@link #FAILED} if the read
-   * threw: the lane then falls back to the lookup alone, which throws if the exception was not a
-   * stale read.
+   * Finds key {@code i} of a batch in a leaf, as {@link #find} does, or gives a negative number if
+   * the node is not a leaf. Gives {@link #POSITION_FAILED} if the read threw: the lane then falls
+   * back to the lookup alone, which throws if the exception was not a stale read.
    */
   @SuppressWarnings("unchecked")
-  private Object valueIn(Node node, Object[] keys, long[] longKeys, int i) {
+  private int positionIn(Node node, Object[] keys, long[] longKeys, int i) {
     if (!(node instanceof Leaf leaf)) {
-      return null;
+      return -1;
     }
     try {
-      int pos = keys != null ? find(leaf, (K) keys[i]) : findLong(leaf, longKeys[i]);
-      return pos >= 0 ? leaf.values[pos] : null;
+      return keys != null ? find(leaf, (K) keys[i]) : findLong(leaf, longKeys[i]);
     } catch (RuntimeException e) {
-      return FAILED;
+      return POSITION_FAILED;
     }
   }
 
@@ -760,7 +851,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       int n = left.count;
       if (left instanceof Leaf leaf) {
         Arrays.fill(leaf.keys, mid, n, null);
-        Arrays.fill(leaf.values, mid, n, null);
+        if (leaf.values != null) {
+          Arrays.fill(leaf.values, mid, n, null);
+        }
         leaf.next = (Leaf) right;
       } else {
         Inner inner = (Inner) left;
@@ -793,9 +886,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     Object separator;
     if (node instanceof Leaf leaf) {
       mid = append ? n - 1 : n >>> 1;
-      Leaf r = new Leaf(leafCapacity, inline != null);
+      Leaf r = new Leaf(leafCapacity, inline != null, primitiveValues);
       System.arraycopy(leaf.keys, mid, r.keys, 0, n - mid);
-      System.arraycopy(leaf.values, mid, r.values, 0, n - mid);
+      copyValues(leaf, mid, r, 0, n - mid);
       r.count = n - mid;
       r.next = leaf.next;
       separator = r.keys[0];
@@ -941,12 +1034,24 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
 
   /** Puts an entry at index {@code pos} of a locked leaf that has room. */
   private void insertAt(Leaf leaf, int pos, K key, V value) {
+    insertAt(leaf, pos, key, value, 0L);
+  }
+
+  /**
+   * Puts an entry at index {@code pos} of a locked leaf that has room. A map of primitive values
+   * stores {@code longValue}, and the others store {@code value}.
+   */
+  private void insertAt(Leaf leaf, int pos, K key, Object value, long longValue) {
     int n = leaf.count;
     long w = inline != null ? window(key, leaf.prefix) : 0L;
     System.arraycopy(leaf.keys, pos, leaf.keys, pos + 1, n - pos);
-    System.arraycopy(leaf.values, pos, leaf.values, pos + 1, n - pos);
+    copyValues(leaf, pos, leaf, pos + 1, n - pos);
     leaf.keys[pos] = key;
-    leaf.values[pos] = value;
+    if (leaf.values != null) {
+      leaf.values[pos] = value;
+    } else {
+      leaf.longValues[pos] = longValue;
+    }
     if (inline != null) {
       System.arraycopy(leaf.windows, pos, leaf.windows, pos + 1, n - pos);
       leaf.windows[pos] = w;
@@ -959,13 +1064,39 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     int n = leaf.count;
     int tail = n - pos - 1;
     System.arraycopy(leaf.keys, pos + 1, leaf.keys, pos, tail);
-    System.arraycopy(leaf.values, pos + 1, leaf.values, pos, tail);
+    copyValues(leaf, pos + 1, leaf, pos, tail);
     if (leaf.windows != null) {
       System.arraycopy(leaf.windows, pos + 1, leaf.windows, pos, tail);
     }
     leaf.keys[n - 1] = null;
-    leaf.values[n - 1] = null;
+    if (leaf.values != null) {
+      leaf.values[n - 1] = null;
+    }
     leaf.count = n - 1;
+  }
+
+  /** Gives value {@code pos} of a leaf. A primitive value comes back as a {@link Long}. */
+  private static Object valueAt(Leaf leaf, int pos) {
+    Object[] values = leaf.values;
+    return values != null ? values[pos] : Long.valueOf(leaf.longValues[pos]);
+  }
+
+  /** Sets value {@code pos} of a locked leaf. A map of primitive values takes a {@link Long}. */
+  private static void setValueAt(Leaf leaf, int pos, Object value) {
+    if (leaf.values != null) {
+      leaf.values[pos] = value;
+    } else {
+      leaf.longValues[pos] = (Long) value;
+    }
+  }
+
+  /** Copies values {@code [from, from + n)} of {@code src} to index {@code to} of {@code dst}. */
+  private static void copyValues(Leaf src, int from, Leaf dst, int to, int n) {
+    if (src.values != null) {
+      System.arraycopy(src.values, from, dst.values, to, n);
+    } else {
+      System.arraycopy(src.longValues, from, dst.longValues, to, n);
+    }
   }
 
   private V put(K key, V value, boolean onlyIfAbsent) {
@@ -980,9 +1111,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       int pos = find(leaf, key);
       if (pos >= 0) {
         @SuppressWarnings("unchecked")
-        V old = (V) leaf.values[pos];
+        V old = (V) valueAt(leaf, pos);
         if (!onlyIfAbsent) {
-          leaf.values[pos] = value;
+          setValueAt(leaf, pos, value);
         }
         return old;
       }
@@ -997,6 +1128,32 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   @Override
   public V put(K key, V value) {
     return put(key(key), value, false);
+  }
+
+  /**
+   * Sets the primitive value of a primitive key, with no boxed value, in a map of primitive values.
+   *
+   * @return the old value, or {@code absent} if the map did not have the key
+   */
+  @SuppressWarnings("unchecked")
+  long putLongValue(long key, long value, long absent, boolean onlyIfAbsent) {
+    K boxed = (K) Long.valueOf(key);
+    Leaf leaf = lockLeaf(boxed, true);
+    try {
+      int pos = find(leaf, boxed);
+      if (pos >= 0) {
+        long old = leaf.longValues[pos];
+        if (!onlyIfAbsent) {
+          leaf.longValues[pos] = value;
+        }
+        return old;
+      }
+      insertAt(leaf, -pos - 1, boxed, null, value);
+    } finally {
+      leaf.unlock();
+    }
+    size.increment();
+    return absent;
   }
 
   @Override
@@ -1021,7 +1178,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         return null;
       }
       @SuppressWarnings("unchecked")
-      V value = (V) leaf.values[pos];
+      V value = (V) valueAt(leaf, pos);
       if (expected != null && !expected.equals(value)) {
         return null;
       }
@@ -1067,8 +1224,8 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         return null;
       }
       @SuppressWarnings("unchecked")
-      V old = (V) leaf.values[pos];
-      leaf.values[pos] = value;
+      V old = (V) valueAt(leaf, pos);
+      setValueAt(leaf, pos, value);
       return old;
     } finally {
       leaf.unlock();
@@ -1085,10 +1242,10 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     }
     try {
       int pos = find(leaf, key);
-      if (pos < 0 || !oldValue.equals(leaf.values[pos])) {
+      if (pos < 0 || !oldValue.equals(valueAt(leaf, pos))) {
         return false;
       }
-      leaf.values[pos] = newValue;
+      setValueAt(leaf, pos, newValue);
       return true;
     } finally {
       leaf.unlock();
@@ -1254,7 +1411,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     }
     // Commit: nothing below throws.
     System.arraycopy(right.keys, 0, left.keys, n, m);
-    System.arraycopy(right.values, 0, left.values, n, m);
+    copyValues(right, 0, left, n, m);
     left.count = n + m;
     left.high = right.high;
     left.next = right.next;
@@ -1429,6 +1586,25 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     while (cursor.hasNext()) {
       cursor.advance();
       action.accept(cursor.key, cursor.value);
+    }
+  }
+
+  /**
+   * Gives each entry with a key in {@code [from, to)} to {@code action}, in key order, while the
+   * action returns {@code true}. Unlike the iterator, it makes no entry object.
+   *
+   * @param from the inclusive lower bound, or {@code null} for no bound
+   * @param to the exclusive upper bound, or {@code null} for no bound
+   * @param action the action; it returns {@code false} to stop
+   */
+  public void forEachInRangeWhile(K from, K to, BiPredicate<? super K, ? super V> action) {
+    Objects.requireNonNull(action);
+    Cursor cursor = new Cursor(from, true, to, false);
+    while (cursor.hasNext()) {
+      cursor.advance();
+      if (!action.test(cursor.key, cursor.value)) {
+        return;
+      }
     }
   }
 
@@ -1742,7 +1918,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
             }
           }
           bufferKeys[m] = k;
-          bufferValues[m] = leaf.values[i];
+          bufferValues[m] = valueAt(leaf, i);
           m++;
         }
       } catch (RuntimeException e) {
@@ -1763,6 +1939,144 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         lastCopied = (K) bufferKeys[m - 1];
       }
       return true;
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Scans of primitive keys
+
+  /** Receives the entries of {@link #scanLong}. */
+  interface LongEntryVisitor {
+
+    /**
+     * Receives one entry. In a map of primitive values, {@code value} is {@code null} and the
+     * value is {@code longValue}. Otherwise {@code longValue} is 0.
+     *
+     * @return {@code false} to stop the scan
+     */
+    boolean visit(long key, Object value, long longValue);
+  }
+
+  /**
+   * Gives the entries with a key from {@code from} to {@code to} to {@code visitor}, in key order,
+   * in a map of {@link InlineKey#LONG}. The scan reads no key object: for this key type, the window
+   * of a key holds every byte after the prefix, and the lower fence of the leaf holds the prefix.
+   *
+   * <p>As the {@link Cursor} does, the scan copies one leaf at a time with an optimistic read, and
+   * gives the entries to the visitor only after the read is valid. It is weakly consistent.
+   */
+  void scanLong(long from, long to, boolean toInclusive, LongEntryVisitor visitor) {
+    int capacity = leafCapacity;
+    long[] keys = new long[capacity];
+    Object[] values = primitiveValues ? null : new Object[capacity];
+    long[] longValues = primitiveValues ? new long[capacity] : null;
+    // The smallest key that the scan did not give yet.
+    long next = from;
+    Leaf leaf = null;
+    while (true) {
+      long v;
+      int start;
+      if (leaf == null) {
+        Node node = root;
+        v = node.version();
+        if (Node.isLocked(v) || node != root) {
+          Thread.onSpinWait();
+          continue;
+        }
+        try {
+          boolean stale = false;
+          while (node instanceof Inner inner) {
+            Node child = inner.children[childIndexLong(inner, next)];
+            long cv = child.version();
+            if (Node.isLocked(cv) || !inner.validate(v)) {
+              stale = true;
+              break;
+            }
+            node = child;
+            v = cv;
+          }
+          if (stale) {
+            Thread.onSpinWait();
+            continue;
+          }
+          leaf = (Leaf) node;
+          int pos = findLong(leaf, next);
+          start = pos >= 0 ? pos : -pos - 1;
+        } catch (RuntimeException e) {
+          if (node.validate(v)) {
+            throw e;
+          }
+          leaf = null;
+          continue;
+        }
+      } else {
+        v = leaf.version();
+        if (Node.isLocked(v)) {
+          leaf = null;
+          continue;
+        }
+        start = 0;
+      }
+      int m = 0;
+      boolean end = false;
+      Leaf following;
+      try {
+        int n = Math.min(leaf.count, capacity);
+        int prefix = leaf.prefix;
+        int shift = prefix << 3;
+        long head =
+            prefix == 0
+                ? 0L
+                : ((Long) leaf.low ^ Long.MIN_VALUE) & (-1L << (Long.SIZE - shift));
+        long[] w = leaf.windows;
+        for (int i = start; i < n; i++) {
+          long key = (head | ((w[i] ^ Long.MIN_VALUE) >>> shift)) ^ Long.MIN_VALUE;
+          if (key < next) {
+            continue;
+          }
+          if (key > to || (key == to && !toInclusive)) {
+            end = true;
+            break;
+          }
+          keys[m] = key;
+          if (longValues != null) {
+            longValues[m] = leaf.longValues[i];
+          } else {
+            values[m] = leaf.values[i];
+          }
+          m++;
+        }
+        following = leaf.next;
+      } catch (RuntimeException e) {
+        if (leaf.validate(v)) {
+          throw e;
+        }
+        leaf = null;
+        continue;
+      }
+      if (!leaf.validate(v)) {
+        leaf = null;
+        continue;
+      }
+      for (int i = 0; i < m; i++) {
+        boolean more =
+            longValues != null
+                ? visitor.visit(keys[i], null, longValues[i])
+                : visitor.visit(keys[i], values[i], 0L);
+        if (!more) {
+          return;
+        }
+      }
+      if (m > 0) {
+        if (keys[m - 1] == Long.MAX_VALUE) {
+          return;
+        }
+        next = keys[m - 1] + 1;
+      }
+      if (end || following == null) {
+        return;
+      }
+      leaf = following;
     }
   }
 
@@ -1850,7 +2164,8 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       }
     } else {
       Leaf leaf = (Leaf) node;
-      for (int i = n; i < leaf.values.length; i++) {
+      check((leaf.longValues != null) == primitiveValues, "wrong value array");
+      for (int i = n; leaf.values != null && i < leaf.values.length; i++) {
         check(leaf.values[i] == null, "stale value at " + i);
       }
     }
@@ -1886,7 +2201,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         check(leaf.low == null, "the first leaf has a lower fence");
       }
       previous[0] = leaf;
-      for (int i = 0; i < n; i++) {
+      for (int i = 0; leaf.values != null && i < n; i++) {
         check(leaf.values[i] != null, "null value at " + i);
       }
       return n;

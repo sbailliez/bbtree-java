@@ -1,0 +1,229 @@
+package io.github.sb.bbtree;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.Random;
+import java.util.TreeMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+class LongLongBBTreeMapTest {
+
+  private static final long ABSENT = -7;
+
+  @ParameterizedTest
+  @ValueSource(ints = {4, 5, 32})
+  void matchesTreeMap(int capacity) {
+    Random random = new Random(capacity);
+    // Keys of every width, keys that share their first 4 or 6 bytes so that nodes get long
+    // prefixes, and the two extreme keys.
+    List<LongSupplier> sources =
+        List.of(
+            () -> random.nextInt(20_000) - 10_000L,
+            () -> random.nextLong() >> random.nextInt(64),
+            () -> 0x1234_5678_0000_0000L | random.nextInt(5_000),
+            () -> 0x7FFF_FFFF_FFFF_0000L | random.nextInt(1 << 16),
+            () ->
+                random.nextBoolean()
+                    ? Long.MIN_VALUE + random.nextInt(3)
+                    : Long.MAX_VALUE - random.nextInt(3));
+    for (LongSupplier keys : sources) {
+      LongLongBBTreeMap map = new LongLongBBTreeMap(capacity, capacity);
+      TreeMap<Long, Long> expected = new TreeMap<>();
+      for (int op = 0; op < 60_000; op++) {
+        long key = keys.getAsLong();
+        long value = random.nextLong();
+        switch (random.nextInt(7)) {
+          case 0, 1, 2 -> assertEquals(or(expected.put(key, value)), map.put(key, value, ABSENT));
+          case 3 -> assertEquals(or(expected.remove(key)), map.remove(key, ABSENT));
+          case 4 ->
+              assertEquals(
+                  or(expected.putIfAbsent(key, value)), map.putIfAbsent(key, value, ABSENT));
+          case 5 -> checkScans(map, expected, key, keys.getAsLong(), random);
+          default -> {
+            assertEquals(or(expected.get(key)), map.get(key, ABSENT));
+            assertEquals(expected.containsKey(key), map.containsKey(key));
+          }
+        }
+        if (op % 6_000 == 0) {
+          assertEquals(expected.size(), map.asMap().checkInvariants());
+          checkGetMany(map, expected, keys);
+        }
+      }
+      assertEquals(expected.size(), map.asMap().checkInvariants());
+      assertEquals(expected, new TreeMap<>(map.asMap()));
+      checkScans(map, expected, Long.MIN_VALUE, Long.MAX_VALUE, random);
+    }
+  }
+
+  private static long or(Long value) {
+    return value != null ? value : ABSENT;
+  }
+
+  private static void checkGetMany(
+      LongLongBBTreeMap map, TreeMap<Long, Long> expected, LongSupplier source) {
+    long[] keys = new long[100];
+    long[] want = new long[keys.length];
+    for (int i = 0; i < keys.length; i++) {
+      keys[i] = source.getAsLong();
+      want[i] = or(expected.get(keys[i]));
+    }
+    long[] got = new long[keys.length];
+    map.getMany(keys, got, ABSENT);
+    assertArrayEquals(want, got);
+  }
+
+  /** Compares the three scans with the TreeMap, between {@code a} and {@code b}. */
+  private static void checkScans(
+      LongLongBBTreeMap map, TreeMap<Long, Long> expected, long a, long b, Random random) {
+    long from = Math.min(a, b);
+    long to = Math.max(a, b);
+    List<Long> got = new ArrayList<>();
+    map.forEachInRange(from, to, (k, v) -> {
+      got.add(k);
+      got.add(v);
+    });
+    assertEquals(flat(expected.subMap(from, true, to, false)), got);
+
+    int limit = random.nextInt(70);
+    List<Long> stopped = new ArrayList<>();
+    map.forEachFrom(from, (k, v) -> {
+      stopped.add(k);
+      stopped.add(v);
+      return stopped.size() < 2 * limit;
+    });
+    List<Long> want = flat(expected.tailMap(from, true));
+    assertEquals(want.subList(0, Math.min(want.size(), Math.max(2, 2 * limit))), stopped);
+
+    List<Long> inRange = new ArrayList<>();
+    map.forEachInRangeWhile(from, to, (k, v) -> inRange.add(k) && inRange.size() < limit);
+    List<Long> wantKeys = new ArrayList<>(expected.subMap(from, true, to, false).keySet());
+    assertEquals(wantKeys.subList(0, Math.min(wantKeys.size(), Math.max(1, limit))), inRange);
+  }
+
+  private static List<Long> flat(NavigableMap<Long, Long> map) {
+    List<Long> out = new ArrayList<>();
+    for (Map.Entry<Long, Long> e : map.entrySet()) {
+      out.add(e.getKey());
+      out.add(e.getValue());
+    }
+    return out;
+  }
+
+  @Test
+  void theBoxedViewSeesThePrimitiveValues() {
+    LongLongBBTreeMap map = new LongLongBBTreeMap(4, 4);
+    for (long k = 0; k < 1_000; k++) {
+      map.put(k, k * 3, ABSENT);
+    }
+    BBTreeMap<Long, Long> view = map.asMap();
+    assertEquals(30L, view.get(10L));
+    assertEquals(30L, view.put(10L, 31L));
+    assertEquals(31L, map.get(10, ABSENT));
+    assertTrue(view.replace(11L, 33L, 34L));
+    assertFalse(view.replace(11L, 33L, 35L));
+    assertEquals(34L, map.get(11, ABSENT));
+    Long[] boxed = new Long[2];
+    view.getMany(new Long[] {12L, 5_000L}, boxed);
+    assertArrayEquals(new Long[] {36L, null}, boxed);
+    assertEquals(1_000, view.checkInvariants());
+    view.clear();
+    assertTrue(map.isEmpty());
+    assertEquals(0, view.checkInvariants());
+  }
+
+  @Test
+  void primitiveValuesNeedLongKeys() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new BBTreeMap<>(
+                InlineKey.UUID, InlineKey.UUID, 4, 4, WindowScan.SCALAR, false, true));
+  }
+
+  @Test
+  void scansSeeSteadyKeysWhileWritersSplitAndEmptyLeaves() throws Exception {
+    LongLongBBTreeMap map = new LongLongBBTreeMap(4, 4);
+    int range = 20_000;
+    // The even keys stay, with the value -key. The writers put and remove the odd keys.
+    for (long k = 0; k < range; k += 2) {
+      map.put(k, -k, ABSENT);
+    }
+    AtomicBoolean stop = new AtomicBoolean();
+    ExecutorService pool = Executors.newFixedThreadPool(4);
+    try {
+      List<Future<?>> tasks = new ArrayList<>();
+      for (int t = 0; t < 2; t++) {
+        tasks.add(
+            pool.submit(
+                () -> {
+                  ThreadLocalRandom r = ThreadLocalRandom.current();
+                  while (!stop.get()) {
+                    long k = r.nextInt(range / 2) * 2L + 1;
+                    if (r.nextBoolean()) {
+                      map.put(k, -k, ABSENT);
+                    } else {
+                      map.remove(k, ABSENT);
+                    }
+                  }
+                }));
+      }
+      for (int t = 0; t < 2; t++) {
+        tasks.add(
+            pool.submit(
+                () -> {
+                  for (int round = 0; round < 200; round++) {
+                    long[] last = {Long.MIN_VALUE};
+                    int[] even = {0};
+                    map.forEachFrom(
+                        0,
+                        (k, v) -> {
+                          assertTrue(k > last[0], "order at " + k);
+                          assertEquals(-k, v);
+                          last[0] = k;
+                          if ((k & 1) == 0) {
+                            even[0]++;
+                          }
+                          return true;
+                        });
+                    assertEquals(range / 2, even[0]);
+                    long[] keys = {0, 2, 4, 1_000, range - 2};
+                    long[] values = new long[keys.length];
+                    map.getMany(keys, values, ABSENT);
+                    for (int i = 0; i < keys.length; i++) {
+                      assertEquals(-keys[i], values[i]);
+                    }
+                  }
+                  return null;
+                }));
+      }
+      for (int i = 2; i < tasks.size(); i++) {
+        tasks.get(i).get(60, TimeUnit.SECONDS);
+      }
+      stop.set(true);
+      for (Future<?> task : tasks) {
+        task.get(10, TimeUnit.SECONDS);
+      }
+    } finally {
+      stop.set(true);
+      pool.shutdownNow();
+    }
+    assertEquals(map.size(), map.asMap().checkInvariants());
+  }
+}

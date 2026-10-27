@@ -28,7 +28,7 @@ import org.openjdk.jmh.annotations.Warmup;
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 @Warmup(iterations = 3, time = 1)
 @Measurement(iterations = 5, time = 1)
-@Fork(value = 1, jvmArgsAppend = {"--add-modules=jdk.incubator.vector"})
+@Fork(value = 1, jvmArgsAppend = {"-XX:+IgnoreUnrecognizedVMOptions", "-XX:+UseTransparentHugePages", "--add-modules=jdk.incubator.vector"})
 public class NodeSearchBenchmark {
 
   private static final int NODES = 256;

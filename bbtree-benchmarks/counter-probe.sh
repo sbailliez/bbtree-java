@@ -15,7 +15,8 @@ else
 fi
 out=$(mktemp)
 trap 'rm -f "$out" "$out.perf"' EXIT
-java -Xms8g -Xmx8g -XX:+AlwaysPreTouch --add-modules=jdk.incubator.vector -cp "$jar" \
+java -Xms8g -Xmx8g -XX:+AlwaysPreTouch -XX:+UseTransparentHugePages ${JAVA_OPTS:-} \
+  --add-modules=jdk.incubator.vector -cp "$jar" \
   io.github.sb.bbtree.CounterProbe "$variant" "$mode" "$ops" > "$out" 2> /dev/null &
 pid=$!
 until grep -q READY "$out"; do sleep 0.2; done

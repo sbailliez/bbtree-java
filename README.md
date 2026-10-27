@@ -27,8 +27,9 @@ Long[] keys = {1L, 42L, 7L};
 String[] values = new String[keys.length];
 map.getMany(keys, values);                     // [null, "answer", null]
 
-// Read a range in key order.
+// Read a range in key order. The second form stops when the action gives false.
 map.forEachInRange(0L, 100L, (k, v) -> System.out.println(k + "=" + v));
+map.forEachInRangeWhile(0L, null, (k, v) -> k < 10);
 
 // Without an InlineKey, the map uses the natural order or a Comparator.
 BBTreeMap<String, String> reversed = new BBTreeMap<>(Comparator.reverseOrder());
@@ -43,7 +44,29 @@ ids.put(42, "answer");
 ids.get(42);                                   // "answer"
 ids.getMany(new long[] {1, 42}, new String[2]);
 ids.asMap();                                   // the same entries as a BBTreeMap<Long, String>
+ids.forEachFrom(40, (k, v) -> k < 50);         // a scan that reads no key object
 ```
+
+For `long` keys and `long` values, `LongLongBBTreeMap` keeps the values in a `long[]` in each
+leaf, so a hit reads no value object. A map cannot hold `null`, so each method that can find no
+entry takes the value to give back in that case:
+
+```java
+LongLongBBTreeMap counts = new LongLongBBTreeMap();
+counts.put(42, 7, -1);                         // -1: there was no old value
+counts.get(42, -1);                            // 7
+counts.get(43, -1);                            // -1
+counts.getMany(new long[] {42, 43}, new long[2], -1);   // [7, -1]
+```
+
+On Graviton3, Zen 5 and Sapphire Rapids, with 1M entries, `LongLongBBTreeMap` made `uint64` hits
+23% to 40% faster than `LongBBTreeMap<Long>`, batch lookups 18% to 31% faster, and scans of 64
+entries 58% to 67% faster.
+
+On Linux, run the JVM with `-XX:+UseTransparentHugePages`. With 2 MB pages, the TLB walks of a
+lookup on Graviton3 went from 2.8 to 0.01, lookups became 13% faster and inserts 12% to 14%
+faster. The JMH benchmarks set it, together with `-XX:+IgnoreUnrecognizedVMOptions`, so that
+they also start on macOS, where the option does not exist.
 
 The built-in inline keys are `LONG`, `INTEGER`, `UUID`, `STRING`, and `BYTES` (`byte[]` in
 unsigned order). For a key type of your own, implement `InlineKey`. Its Javadoc gives the
@@ -136,6 +159,7 @@ measurements of this port:
 | `DifferentialTest` | Runs 60,000 random operations for each of 15 configurations against a `TreeMap`, including maps with 4-byte inner windows and keys that tie on 4 bytes. Every 2,000 operations, it checks the tree structure and that no empty leaf remains. |
 | `BBTreeMapTest` | Unit tests: ranges, iterators, `getMany`, compaction, ascending loads, and exceptions from user code, which must leave no lock held. |
 | `ConcurrencyTest` | Readers, iterators, and batch lookups run while writers split nodes and empty whole subtrees. Steady keys must never disappear. Also atomic `merge` and single removal. |
+| `LongBBTreeMapTest`, `LongLongBBTreeMapTest` | The primitive APIs against a `TreeMap`, with keys at every prefix length and at `Long.MIN_VALUE` and `Long.MAX_VALUE`, and scans while writers split and empty leaves. |
 | `GuavaMapContractTest` | The `ConcurrentMap` contract suites of guava-testlib, for 3 configurations. |
 
 Small nodes (4 entries) in most tests make splits and leaf removals frequent.

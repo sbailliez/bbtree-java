@@ -45,7 +45,7 @@ import org.openjdk.jmh.annotations.Warmup;
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 @Warmup(iterations = 3, time = 1)
 @Measurement(iterations = 5, time = 1)
-@Fork(value = 1, jvmArgsAppend = {"-Xms4g", "-Xmx4g", "--add-modules=jdk.incubator.vector"})
+@Fork(value = 1, jvmArgsAppend = {"-XX:+IgnoreUnrecognizedVMOptions", "-XX:+UseTransparentHugePages", "-Xms4g", "-Xmx4g", "--add-modules=jdk.incubator.vector"})
 public class WindowWidthBenchmark {
 
   private static final VectorSpecies<Long> LONGS = LongVector.SPECIES_PREFERRED;

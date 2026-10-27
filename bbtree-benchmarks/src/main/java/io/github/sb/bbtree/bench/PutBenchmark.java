@@ -25,7 +25,7 @@ import org.openjdk.jmh.annotations.Warmup;
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 @Warmup(iterations = 3)
 @Measurement(iterations = 5)
-@Fork(value = 1, jvmArgsAppend = {"-Xms8g", "-Xmx8g", "-XX:+AlwaysPreTouch", "--add-modules=jdk.incubator.vector"})
+@Fork(value = 1, jvmArgsAppend = {"-XX:+IgnoreUnrecognizedVMOptions", "-XX:+UseTransparentHugePages", "-Xms8g", "-Xmx8g", "-XX:+AlwaysPreTouch", "--add-modules=jdk.incubator.vector"})
 public class PutBenchmark {
 
   public static final int SIZE = 1_000_000;
