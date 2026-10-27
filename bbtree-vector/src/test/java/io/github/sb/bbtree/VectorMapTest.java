@@ -21,6 +21,9 @@ class VectorMapTest {
       BBTreeMap<String, Long> strings =
           VectorBBTreeMaps.create(InlineKey.STRING, mode, capacity, capacity);
       run(strings, new TreeMap<>(), r -> "https://example.com/" + r.nextInt(20_000));
+      // Keys that differ only in their low 4 bytes, so that the 4-byte inner windows tie.
+      BBTreeMap<Long, Long> tied = VectorBBTreeMaps.create(InlineKey.LONG, mode, capacity, capacity);
+      run(tied, new TreeMap<>(), r -> (long) r.nextInt(3) << 32 | r.nextInt(20_000) * 997L);
     }
   }
 

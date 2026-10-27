@@ -53,6 +53,12 @@ class ConcurrencyTest {
         Arguments.of(
             "LONG default", (Supplier<BBTreeMap<Long, Long>>) () -> new BBTreeMap<>(InlineKey.LONG)),
         Arguments.of(
+            "LONG 4/4 narrow inner",
+            (Supplier<BBTreeMap<Long, Long>>)
+                () ->
+                    new BBTreeMap<>(
+                        InlineKey.LONG, InlineKey.LONG, 4, 4, WindowScan.SCALAR, true)),
+        Arguments.of(
             "natural 4/4",
             (Supplier<BBTreeMap<Long, Long>>) () -> new BBTreeMap<>(null, null, 4, 4)));
   }

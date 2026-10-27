@@ -28,4 +28,26 @@ class VectorWindowScanTest {
       assertEquals(expected, VectorWindowScan.SCAN.scan(windows, n, target), "SCAN " + at);
     }
   }
+
+  @Test
+  void vectorScansOfNarrowWindowsMatchTheScalarScan() {
+    Random random = new Random(12);
+    int[] values = {Integer.MIN_VALUE, -7, -1, 0, 1, 5, Integer.MAX_VALUE - 1, Integer.MAX_VALUE};
+    for (int round = 0; round < 20_000; round++) {
+      int capacity = 4 + random.nextInt(130);
+      int align = BBTreeMap.NARROW_ALIGNMENT;
+      int[] windows = new int[(capacity + align - 1) / align * align];
+      Arrays.fill(windows, Integer.MAX_VALUE);
+      int n = random.nextInt(capacity + 1);
+      for (int i = 0; i < n; i++) {
+        windows[i] = values[random.nextInt(values.length)];
+      }
+      Arrays.sort(windows, 0, n);
+      int target = values[random.nextInt(values.length)];
+      long expected = WindowScan.SCALAR.scan(windows, n, target);
+      String at = "n " + n + ", target " + target + ", " + Arrays.toString(windows);
+      assertEquals(expected, VectorWindowScan.COUNT.scan(windows, n, target), "COUNT " + at);
+      assertEquals(expected, VectorWindowScan.SCAN.scan(windows, n, target), "SCAN " + at);
+    }
+  }
 }

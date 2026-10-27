@@ -300,4 +300,48 @@ class BBTreeMapTest {
     it.forEachRemaining(e -> out.add(e.getKey()));
     return out;
   }
+
+  /** {@link InlineKey#LONG}, with a count of the key compares. */
+  private static final class CountingLongKey implements InlineKey<Long> {
+    long compares;
+
+    @Override
+    public int compare(Long a, Long b) {
+      compares++;
+      return Long.compare(a, b);
+    }
+
+    @Override
+    public long window(Long key, int offset) {
+      return InlineKey.LONG.window(key, offset);
+    }
+
+    @Override
+    public int commonPrefix(Long a, Long b) {
+      return InlineKey.LONG.commonPrefix(a, b);
+    }
+
+    @Override
+    public int fixedLength() {
+      return Long.BYTES;
+    }
+  }
+
+  @Test
+  void fourByteWindowsCompareNoKeysOfDenseLongs() {
+    // Dense keys share their first 4 bytes. The root and the border nodes have no prefix, so
+    // they must search the 8-byte windows, which are exact for LONG.
+    CountingLongKey inline = new CountingLongKey();
+    BBTreeMap<Long, Long> map = new BBTreeMap<>(inline, inline, 8, 8, WindowScan.SCALAR, true);
+    for (long k = 0; k < 100_000; k++) {
+      map.put(k, k);
+    }
+    assertTrue(map.height() >= 4);
+    map.checkInvariants();
+    inline.compares = 0;
+    for (long k = -10; k < 100_010; k++) {
+      assertEquals(k >= 0 && k < 100_000 ? k : null, map.get(k));
+    }
+    assertEquals(0, inline.compares);
+  }
 }

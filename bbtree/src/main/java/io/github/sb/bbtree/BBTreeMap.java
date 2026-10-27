@@ -24,7 +24,10 @@ import java.util.function.BiConsumer;
  * scans the sorted windows up to the first one that is not smaller than the window of the
  * target. The map reads a key object only when two windows tie. For keys of a fixed
  * length that the window covers, such as {@link Long}, a tie is a match and the map reads no key
- * object at all.
+ * object at all. For key types of a fixed length, the vector maps of bbtree-vector also keep the
+ * first 4 bytes of each window in the inner nodes, and search them in the nodes with two fences.
+ * Thus 64 separators take 256 bytes in place of 512, and a tie on 4 bytes compares the
+ * separators.
  *
  * <p><b>Concurrency.</b> Each node has a version lock. A read writes no shared memory: it reads
  * the version of a node, reads the node, and validates the version. If a writer changed the node,
@@ -59,6 +62,12 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   static final int MIN_CAPACITY = 4;
   static final int MAX_CAPACITY = 1024;
 
+  /**
+   * The length of each array of 4-byte inner windows is a multiple of this number: 64 windows,
+   * the int lanes of the widest vector register that Java supports (2048-bit SVE).
+   */
+  static final int NARROW_ALIGNMENT = 64;
+
   /** The number of lookups that {@link #getMany} interleaves. */
   private static final int BATCH_LANES = 16;
 
@@ -68,6 +77,16 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
 
   /** A node with a prefix of this length or more compares no key on a window tie. */
   private final int exactFrom;
+
+  /** An inner node with 4-byte windows and a prefix of this length or more compares no key. */
+  private final int narrowExactFrom;
+
+  /**
+   * {@code true} if the inner nodes also keep 4-byte windows ({@link Inner#narrow}). A node with
+   * both fences searches them. The root and the nodes on the left and right borders have a prefix
+   * of 0, so dense keys would tie on 4 bytes there: these nodes search the 8-byte windows.
+   */
+  private final boolean narrow;
 
   private final int leafCapacity;
   private final int innerCapacity;
@@ -111,10 +130,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     this(Objects.requireNonNull(inlineKey), inlineKey, leafCapacity, innerCapacity);
   }
 
-  @SuppressWarnings("unchecked")
   BBTreeMap(
       Comparator<? super K> comparator, InlineKey<K> inline, int leafCapacity, int innerCapacity) {
-    this(comparator, inline, leafCapacity, innerCapacity, WindowScan.SCALAR);
+    this(comparator, inline, leafCapacity, innerCapacity, WindowScan.SCALAR, false);
   }
 
   @SuppressWarnings("unchecked")
@@ -123,7 +141,8 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       InlineKey<K> inline,
       int leafCapacity,
       int innerCapacity,
-      WindowScan scan) {
+      WindowScan scan,
+      boolean narrowInnerWindows) {
     if (leafCapacity < MIN_CAPACITY || leafCapacity > MAX_CAPACITY) {
       throw new IllegalArgumentException("leafCapacity out of range: " + leafCapacity);
     }
@@ -136,9 +155,20 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     this.scan = Objects.requireNonNull(scan);
     int fixed = inline == null ? -1 : inline.fixedLength();
     this.exactFrom = fixed < 0 ? Integer.MAX_VALUE : fixed - Long.BYTES;
+    this.narrowExactFrom = fixed < 0 ? Integer.MAX_VALUE : fixed - Integer.BYTES;
+    this.narrow = inline != null && narrowInnerWindows;
     this.leafCapacity = leafCapacity;
     this.innerCapacity = innerCapacity;
     this.root = new Leaf(leafCapacity, inline != null);
+  }
+
+  /**
+   * Gives {@code true} if 4-byte inner windows suit this key encoding: the encodings of a fixed
+   * length. Strings and byte arrays tie too often on 4 bytes. The scalar scan gets no gain from
+   * 4-byte windows, so only the vector maps of bbtree-vector use them.
+   */
+  static boolean narrowSuits(InlineKey<?> inline) {
+    return inline != null && inline.fixedLength() >= 0;
   }
 
   /**
@@ -205,6 +235,17 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
 
   /** Gives the index of the child of an inner node that holds {@code key}. */
   private int childIndex(Inner node, K key) {
+    int[] nw = node.narrow;
+    if (nw != null && node.low != null && node.high != null) {
+      long position =
+          scan.scan(nw, Math.min(node.count, nw.length), narrow(window(key, node.prefix)));
+      int lo = (int) (position >>> 32);
+      int hi = (int) position;
+      if (lo == hi || node.prefix >= narrowExactFrom) {
+        return hi;
+      }
+      return upperBound(node.keys, lo, hi, key);
+    }
     long[] w = node.windows;
     if (w == null) {
       return upperBound(node.keys, 0, Math.min(node.count, node.keys.length), key);
@@ -236,6 +277,15 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   }
 
   /**
+   * Gives the 4-byte window of an inner node: the first 4 bytes of the 8-byte window. The sign bit
+   * of the 8-byte window is the sign bit of the result, so a signed compare still gives the
+   * unsigned order.
+   */
+  static int narrow(long window) {
+    return (int) (window >> 32);
+  }
+
+  /**
    * Gives the window of a primitive {@code long} key, as {@link InlineKey#LONG} gives it for the
    * boxed key, with the sign bit flipped.
    */
@@ -257,8 +307,28 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
 
   /** Gives the child of an inner node for a primitive key, as {@link #findLong} does. */
   private int childIndexLong(Inner node, long key) {
-    long[] w = node.windows;
-    return (int) scan.scan(w, Math.min(node.count, w.length), longWindow(key, node.prefix));
+    int[] nw = node.narrow;
+    if (nw == null || node.low == null || node.high == null) {
+      long[] w = node.windows;
+      return (int) scan.scan(w, Math.min(node.count, w.length), longWindow(key, node.prefix));
+    }
+    long position =
+        scan.scan(nw, Math.min(node.count, nw.length), narrow(longWindow(key, node.prefix)));
+    int lo = (int) (position >>> 32);
+    int hi = (int) position;
+    if (lo == hi || node.prefix >= narrowExactFrom) {
+      return hi;
+    }
+    Object[] keys = node.keys;
+    while (lo < hi) {
+      int mid = (lo + hi) >>> 1;
+      if ((Long) keys[mid] <= key) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -488,6 +558,12 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     if (node == null) {
       return 0;
     }
+    if (node instanceof Inner inner
+        && inner.narrow != null
+        && node.low != null
+        && node.high != null) {
+      return (node.count & 1) + (inner.narrow[0] & 1);
+    }
     long[] w = node.windows;
     return (node.count & 1) + (w != null ? w[0] & 1 : 0);
   }
@@ -600,42 +676,56 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       if (!node.tryUpgrade(v)) {
         return;
       }
+      boolean split = false;
       try {
         if (root != node) {
           return;
         }
-        Split split = prepareSplit(node, key, 0);
-        Inner top = new Inner(innerCapacity, inline != null);
-        split.commit();
+        Split s = prepareSplit(node, key, 0);
+        Inner top = new Inner(innerCapacity, inline != null, narrow);
+        s.commit();
+        split = true;
         top.children[0] = node;
-        top.children[1] = split.right;
-        top.keys[0] = split.separator;
-        if (inline != null) {
-          top.windows[0] = split.separatorWindow;
-        }
+        top.children[1] = s.right;
+        top.keys[0] = s.separator;
+        setWindow(top, 0, s.separatorWindow);
         top.count = 1;
         root = top;
       } finally {
-        node.unlock();
+        unlock(node, split);
       }
       return;
     }
     if (!parent.tryUpgrade(pv)) {
       return;
     }
+    boolean split = false;
     try {
       if (!node.tryUpgrade(v)) {
         return;
       }
       try {
-        Split split = prepareSplit(node, key, parent.prefix);
-        split.commit();
-        insertChild(parent, slot, split.separator, split.separatorWindow, split.right);
+        Split s = prepareSplit(node, key, parent.prefix);
+        s.commit();
+        split = true;
+        insertChild(parent, slot, s.separator, s.separatorWindow, s.right);
       } finally {
-        node.unlock();
+        unlock(node, split);
       }
     } finally {
-      parent.unlock();
+      unlock(parent, split);
+    }
+  }
+
+  /**
+   * Unlocks a node. A node that did not change keeps its old version, so that its readers do not
+   * start again.
+   */
+  private static void unlock(Node node, boolean changed) {
+    if (changed) {
+      node.unlock();
+    } else {
+      node.unlockUnchanged();
     }
   }
 
@@ -676,6 +766,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         Inner inner = (Inner) left;
         Arrays.fill(inner.keys, mid, n, null);
         Arrays.fill(inner.children, mid + 1, n + 1, null);
+        if (inner.narrow != null) {
+          Arrays.fill(inner.narrow, mid, n, Integer.MAX_VALUE);
+        }
       }
       left.count = mid;
       left.high = separator;
@@ -710,7 +803,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     } else {
       Inner inner = (Inner) node;
       mid = append ? n - 2 : n >>> 1;
-      Inner r = new Inner(innerCapacity, inline != null);
+      Inner r = new Inner(innerCapacity, inline != null, narrow);
       System.arraycopy(inner.keys, mid + 1, r.keys, 0, n - mid - 1);
       System.arraycopy(inner.children, mid + 1, r.children, 0, n - mid);
       r.count = n - mid - 1;
@@ -736,16 +829,21 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
 
   /**
    * Gives the windows of {@code node.keys[from, from + n)} at a new prefix, from index 0, for a
-   * half of a split. A split never makes a prefix shorter. If the old windows hold the whole rest
-   * of each key, as for fixed-length keys such as {@link Long}, the new windows are the old ones
-   * shifted, and no key object is read. Otherwise the windows come from the keys.
+   * half of a split. A split never makes a prefix shorter. If the prefix does not change, the new
+   * windows are a copy of the old ones. If the old windows hold the whole rest of each key, as for
+   * fixed-length keys such as {@link Long}, the new windows are the old ones shifted. In these two
+   * cases no key object is read. Otherwise the windows come from the keys.
    */
   private long[] windowsAfterSplit(Node node, int from, int n, int prefix) {
     if (inline == null) {
       return null;
     }
-    if (node.prefix < exactFrom || prefix < node.prefix) {
+    boolean same = prefix == node.prefix;
+    if (!same && (node.prefix < exactFrom || prefix < node.prefix)) {
       return windowsOf(node.keys, from, n, prefix);
+    }
+    if (same) {
+      return Arrays.copyOfRange(node.windows, from, from + n);
     }
     int bits = (prefix - node.prefix) << 3;
     long[] windows = new long[node.capacity()];
@@ -777,11 +875,31 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     return windows;
   }
 
-  /** Sets the prefix of a locked node, and its windows if {@code windows} is not {@code null}. */
+  /**
+   * Sets the prefix of a locked node, and its first {@code count} windows if {@code windows} is
+   * not {@code null}. An inner node with 4-byte windows also keeps the first 4 bytes of each.
+   */
   private static void setPrefix(Node node, int prefix, long[] windows) {
     node.prefix = prefix;
-    if (windows != null) {
-      System.arraycopy(windows, 0, node.windows, 0, node.count);
+    if (windows == null) {
+      return;
+    }
+    System.arraycopy(windows, 0, node.windows, 0, node.count);
+    if (node instanceof Inner inner && inner.narrow != null) {
+      for (int i = 0; i < node.count; i++) {
+        inner.narrow[i] = narrow(windows[i]);
+      }
+    }
+  }
+
+  /** Sets window {@code i} of a locked node, if the node has windows. */
+  private static void setWindow(Node node, int i, long window) {
+    if (node.windows == null) {
+      return;
+    }
+    node.windows[i] = window;
+    if (node instanceof Inner inner && inner.narrow != null) {
+      inner.narrow[i] = narrow(window);
     }
   }
 
@@ -797,6 +915,10 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       System.arraycopy(node.windows, slot, node.windows, slot + 1, n - slot);
       node.windows[slot] = separatorWindow;
     }
+    if (node.narrow != null) {
+      System.arraycopy(node.narrow, slot, node.narrow, slot + 1, n - slot);
+      node.narrow[slot] = narrow(separatorWindow);
+    }
     node.count = n + 1;
   }
 
@@ -807,6 +929,10 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     System.arraycopy(node.children, childIndex + 1, node.children, childIndex, n - childIndex);
     if (node.windows != null) {
       System.arraycopy(node.windows, keyIndex + 1, node.windows, keyIndex, n - keyIndex - 1);
+    }
+    if (node.narrow != null) {
+      System.arraycopy(node.narrow, keyIndex + 1, node.narrow, keyIndex, n - keyIndex - 1);
+      node.narrow[n - 1] = Integer.MAX_VALUE;
     }
     node.keys[n - 1] = null;
     node.children[n] = null;
@@ -1048,7 +1174,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       return false;
     }
     if (root != top || top.count != 0) {
-      top.unlock();
+      top.unlockUnchanged();
       return false;
     }
     root = ((Inner) top).children[0];
@@ -1063,6 +1189,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     if (!parent.tryUpgrade(pv)) {
       return false;
     }
+    boolean removed = false;
     try {
       // The parent is locked, so its children do not change.
       boolean fromLeft = slot > 0;
@@ -1079,10 +1206,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         return false;
       }
       if (!second.tryUpgrade(fromLeft ? ev : sv)) {
-        first.unlock();
+        first.unlockUnchanged();
         return false;
       }
-      boolean removed = false;
       try {
         if (steal) {
           stealChild((Inner) empty, (Inner) sibling, parent, slot, fromLeft);
@@ -1097,15 +1223,15 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         return true;
       } finally {
         // The node that left the tree stays locked.
-        if (!removed || first != gone) {
-          first.unlock();
+        if (first != gone || !removed) {
+          unlock(first, removed);
         }
-        if (!removed || second != gone) {
-          second.unlock();
+        if (second != gone || !removed) {
+          unlock(second, removed);
         }
       }
     } finally {
-      parent.unlock();
+      unlock(parent, removed);
     }
   }
 
@@ -1183,14 +1309,15 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     sibling.low = siblingLow;
     sibling.high = siblingHigh;
     if (emptyWindows != null) {
-      empty.windows[0] = emptyWindows[0];
+      setWindow(empty, 0, emptyWindows[0]);
     }
     empty.prefix = emptyPrefix;
     setPrefix(sibling, siblingPrefix, siblingWindows);
-    parent.keys[keyIndex] = newSeparator;
-    if (inline != null) {
-      parent.windows[keyIndex] = separatorWindow;
+    if (sibling.narrow != null) {
+      sibling.narrow[n - 1] = Integer.MAX_VALUE;
     }
+    parent.keys[keyIndex] = newSeparator;
+    setWindow(parent, keyIndex, separatorWindow);
   }
 
   /** Gives the only child of a locked, empty inner node to its locked left neighbor. */
@@ -1733,8 +1860,18 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
               ? 0
               : inline.commonPrefix((K) node.low, (K) node.high);
       check(node.prefix == prefix, "prefix " + node.prefix + " but expected " + prefix);
+      int[] nw = node instanceof Inner inner ? inner.narrow : null;
+      check((nw != null) == (narrow && node instanceof Inner), "wrong window width");
       for (int i = 0; i < n; i++) {
-        check(node.windows[i] == window((K) node.keys[i], prefix), "stale window at " + i);
+        long w = window((K) node.keys[i], prefix);
+        check(node.windows[i] == w, "stale window at " + i);
+        check(nw == null || nw[i] == narrow(w), "stale 4-byte window at " + i);
+      }
+      if (nw != null) {
+        check(nw.length % NARROW_ALIGNMENT == 0, "narrow windows not aligned");
+        for (int i = n; i < nw.length; i++) {
+          check(nw[i] == Integer.MAX_VALUE, "tail window not the maximum at " + i);
+        }
       }
     }
     if (node instanceof Leaf leaf) {

@@ -4,9 +4,10 @@ package io.github.sb.bbtree;
  * Makes {@link BBTreeMap} instances whose node search uses the Java Vector API. The JVM must run
  * with {@code --add-modules jdk.incubator.vector}.
  *
- * <p>Measure before you use it: the scalar scan of {@link BBTreeMap} can be as fast or faster,
- * because the windows are 64 bits wide and a register holds few of them. The README of the
- * project gives the measured results.
+ * <p>The vector count compares whole registers with no branch on the data. For key types of a
+ * fixed length, such as {@link InlineKey#LONG} and {@link InlineKey#UUID}, the inner nodes keep
+ * 4-byte windows, so one 128-bit NEON register compares 4 separators. The README of the project
+ * gives the measured results.
  */
 public final class VectorBBTreeMaps {
 
@@ -48,7 +49,24 @@ public final class VectorBBTreeMaps {
   public static <K, V> BBTreeMap<K, V> create(
       InlineKey<K> inlineKey, Mode mode, int leafCapacity, int innerCapacity) {
     WindowScan scan = mode == Mode.COUNT ? VectorWindowScan.COUNT : VectorWindowScan.SCAN;
-    return new BBTreeMap<>(inlineKey, inlineKey, leafCapacity, innerCapacity, scan);
+    return new BBTreeMap<>(
+        inlineKey,
+        inlineKey,
+        leafCapacity,
+        innerCapacity,
+        scan,
+        BBTreeMap.narrowSuits(inlineKey));
+  }
+
+  /**
+   * Makes an empty map of primitive {@code long} keys with the default node capacities.
+   *
+   * @param mode the vector search
+   * @param <V> the value type
+   * @return the map
+   */
+  public static <V> LongBBTreeMap<V> createLong(Mode mode) {
+    return new LongBBTreeMap<>(create(InlineKey.LONG, mode));
   }
 
   /**

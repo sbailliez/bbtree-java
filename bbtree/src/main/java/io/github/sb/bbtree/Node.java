@@ -34,7 +34,7 @@ abstract sealed class Node permits Leaf, Inner {
 
   /**
    * The window of each key, with the sign bit flipped so that a signed compare of two windows
-   * gives their unsigned order. Unused when the map has no {@link InlineKey}.
+   * gives their unsigned order. {@code null} when the map has no {@link InlineKey}.
    */
   final long[] windows;
 
@@ -104,6 +104,14 @@ abstract sealed class Node permits Leaf, Inner {
   /** Unlocks the node. The release store publishes the plain writes before it. */
   final void unlock() {
     VERSION.setRelease(this, (long) VERSION.get(this) + 1);
+  }
+
+  /**
+   * Unlocks a node that the writer did not change, at the version from before the lock. Thus the
+   * readers that read the node before the lock stay valid, and do not start again from the root.
+   */
+  final void unlockUnchanged() {
+    VERSION.setRelease(this, (long) VERSION.get(this) - 1);
   }
 
   final boolean isLeaf() {

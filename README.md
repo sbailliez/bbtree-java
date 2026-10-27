@@ -79,9 +79,10 @@ instructions, then the cache coherence traffic. Each item below decreases one of
    Java has no prefetch instruction, and an acquire load stops later loads. Thus each level
    first searches all lanes and loads each child with a plain load, which starts the cache misses
    together. Then it reads the versions and validates the lanes.
-7. **Shifted windows on split.** For `Long`, `Integer`, and `UUID`, a window holds the whole
-   rest of the key. A split makes the prefix of each half longer, so the new windows are the old
-   windows shifted to the left, and the split reads no key object.
+7. **Windows on split without key reads.** If the prefix of a half does not change, the half
+   copies its windows. For `Long`, `Integer`, and `UUID`, a window holds the whole rest of the
+   key. When a split makes the prefix of a half longer, the new windows are the old windows
+   shifted to the left. In both cases the split reads no key object.
 8. **Append splits.** When a key goes after the last key of the rightmost node, the split moves
    only the last key. Ascending keys, such as UUID v7 or sequence numbers, fill the leaves to 31
    of 32 entries, not to half.
@@ -89,8 +90,8 @@ instructions, then the cache coherence traffic. Each item below decreases one of
 ## Differences from the Rust bbtree
 
 - No SIMD in the core, because the Vector API is an incubator module. The module `bbtree-vector`
-  has a Vector API search, which made `get` 4% to 17% faster on the machine of the measurements
-  (see below).
+  has a Vector API search with 4-byte inner windows. It made `get` 9% to 24% faster than the
+  scalar map on the machine of the measurements (see below).
 - Removal removes empty nodes only. An empty leaf merges with a sibling, an empty inner node gives
   its child to a sibling (or takes one from a full sibling), and a root with one child gives its
   place to the child. A map that becomes empty goes back to one leaf. The Rust bbtree also
@@ -101,12 +102,29 @@ instructions, then the cache coherence traffic. Each item below decreases one of
 
 ### Possible next steps
 
-These changes were measured or estimated in a review, but they are not done:
+A review of the [design documents](https://github.com/XiangpengHao/bbtree/tree/main/design)
+of the Rust bbtree found these gaps. The numbers are those of the Rust design documents, not
+measurements of this port:
 
 - **A node layout with fewer objects.** A lookup level reads the node object, then its `long[]`
   of windows, then its `children` array: three dependent loads, where the Rust page has two.
   Estimated gain: 20% to 30% of `get`. It needs a rewrite without the `Node` classes.
-- **Hash tags, a prefix for the whole tree, and 2-byte windows**, as in the Rust bbtree.
+- **A prefix for the whole tree (D50).** The root and the border nodes have no fence on one side,
+  so their prefix is 0. Keys with a shared start, such as URLs, tie on every window there. Rust:
+  path lookups 426 to 375 ns.
+- **Hash tags (D36).** A 1-byte tag from the hash of the key would avoid most key reads of a
+  string hit or miss. Rust: path hits −10.7%, misses −31.2%.
+- **A string encoding of 1 byte for each ASCII character.** `InlineKey.STRING` uses UTF-16, so an
+  8-byte window holds only 4 characters.
+- **An append to the last leaf without a descent (D45).** Rust: 10M ordered `u64` inserts 31.1 to
+  5.3 ns.
+- **A batch insert (D53)** and an atomic update-or-insert in one descent. `putAll`, `merge` and
+  `compute` use the defaults of `AbstractMap` and `ConcurrentMap`.
+- **A reader that waits at a locked leaf** in place of a new descent from the root, for leaves
+  that many threads write.
+- **Short separators**, and an end split that also applies inside the key space.
+- **A test with a controlled thread schedule**, such as Lincheck. The Rust design records 2 races
+  that only a controlled scheduler found.
 
 ## Tests
 
@@ -115,7 +133,7 @@ These changes were measured or estimated in a review, but they are not done:
 | Test | What it does |
 |---|---|
 | `InlineKeyContractTest` | Compares each built-in `InlineKey` with a reference byte encoding: order, windows at each offset, common prefix. |
-| `DifferentialTest` | Runs 60,000 random operations for each of 10 configurations against a `TreeMap`. Every 2,000 operations, it checks the tree structure and that no empty leaf remains. |
+| `DifferentialTest` | Runs 60,000 random operations for each of 15 configurations against a `TreeMap`, including maps with 4-byte inner windows and keys that tie on 4 bytes. Every 2,000 operations, it checks the tree structure and that no empty leaf remains. |
 | `BBTreeMapTest` | Unit tests: ranges, iterators, `getMany`, compaction, ascending loads, and exceptions from user code, which must leave no lock held. |
 | `ConcurrencyTest` | Readers, iterators, and batch lookups run while writers split nodes and empty whole subtrees. Steady keys must never disappear. Also atomic `merge` and single removal. |
 | `GuavaMapContractTest` | The `ConcurrentMap` contract suites of guava-testlib, for 3 configurations. |
@@ -141,10 +159,13 @@ java -jar bbtree-benchmarks/target/benchmarks.jar ConcurrentBenchmark -t 16
 | `LongKeyBenchmark` | Lookups of `long` keys as spread `Long` objects, as boxed `long` values, and with `LongBBTreeMap`. |
 | `WindowWidthBenchmark` | One node search over windows of 8, 4 or 2 bytes, scalar and vector, in the cache and out of it. |
 | `NodeSearchBenchmark` | One node search with the windows in the L1 cache: the scalar scan and the two vector scans. |
+| `CrossLanguage` | The workloads of [bbtree-go](https://github.com/richardartoul/bbtree-go), with the same flags and output, to compare Java with Go and Rust. See below. |
 
-The `impl` values are `bbtree`, `bbtree-vector-scan`, `bbtree-vector-count`, `bbtree-noinline`,
-`treemap`, `skiplist`, and `rwlock-treemap`. The key types are `long`, `uuid4` (random UUID), `uuid7` (time-ordered UUID, in time order), and
-`string` (URL-like, with a 29-character shared prefix). The `impl` parameter also accepts
+The `impl` values are `bbtree`, `bbtree-narrow` (scalar, with 4-byte inner windows),
+`bbtree-vector-scan`, `bbtree-vector-count`, `bbtree-vector-count-wide` (8-byte inner windows),
+`bbtree-noinline`, `treemap`, `skiplist`, and `rwlock-treemap`. The key types are `long`,
+`dense` (the integers 0 to n − 1), `uuid4` (random UUID), `uuid7` (time-ordered UUID, in time
+order), and `string` (URL-like, with a 29-character shared prefix). The `impl` parameter also accepts
 `bbtree-<leaf>x<inner>`, for example `bbtree-64x64`, to compare node capacities.
 
 ### Results
@@ -211,49 +232,126 @@ locked TreeMap 0.8 to 1.0 million operations per second.
 
 ## The Vector API variant
 
-The module `bbtree-vector` gives node scans that use the Java Vector API
+The module `bbtree-vector` gives node searches that use the Java Vector API
 (`jdk.incubator.vector`). It needs Java 25 and `--add-modules jdk.incubator.vector`.
 
 ```java
 BBTreeMap<Long, String> map =
-    VectorBBTreeMaps.create(InlineKey.LONG, VectorBBTreeMaps.Mode.SCAN);
+    VectorBBTreeMaps.create(InlineKey.LONG, VectorBBTreeMaps.Mode.COUNT);
+LongBBTreeMap<String> longs = VectorBBTreeMaps.createLong(VectorBBTreeMaps.Mode.COUNT);
 ```
 
-It has two modes:
-
 - `COUNT` compares every window and counts, with no branch on the data, as the Rust bbtree does.
+  It subtracts each compare mask from lane counters and adds the lanes one time at the end.
 - `SCAN` compares one register of windows at a time, and stops at the first window that is not
   smaller than the target.
 
-**Result: on this machine, the vector `COUNT` makes a single `get` 4% to 17% faster. It does not
-help `getMany`, and inserts showed no consistent difference in two runs.** The gain does not come
-from wide compares: a `LongVector` holds only 2 windows. It comes from the count with no branch.
-The scalar scan stops at a random place in each node, and the CPU mispredicts that exit branch
-once on each level.
+For key types of a fixed length (`LONG`, `INTEGER`, `UUID`), the inner nodes of a vector map
+also keep the first 4 bytes of each window, in an `int[]`. A 128-bit NEON register then compares
+4 separators in place of 2. The slots after the live ones hold `Integer.MAX_VALUE`, and the
+array length is a multiple of 64, so the count reads whole registers with no mask. Only the
+inner nodes with two fences search the 4-byte windows. The root and the border nodes have a
+prefix of 0, so dense keys, such as the integers 0 to n − 1, would tie on 4 bytes there. These
+nodes search the 8-byte windows. A tie on 4 bytes compares the separators.
 
-`get` on 1M keys, in ns, median of 3 rounds that alternate the two maps (load average 8 to 20):
+**Result: the vector `COUNT` with 4-byte inner windows makes `get` 5% to 22% faster than the
+scalar map, except for time-ordered `uuid7` keys. It makes inserts 23% to 33% slower.**
 
-| Keys | Scalar | Vector `COUNT` |
-|---|--:|--:|
-| `long` | 284 | 273 |
-| `uuid4` | 299 | 252 |
-| `string` | 387 | 323 |
+`GetBenchmark` and `PutBenchmark`, 4 forks of 3 iterations each, on a quiet machine. Time per
+operation in ns:
 
-`getMany` per key was equal within 3%, or 9% slower for `string`.
+| Keys | Size | Scalar | Vector, 8-byte inner windows | Vector, 4-byte inner windows |
+|---|--:|--:|--:|--:|
+| `get` `long` | 1M | 206 ± 21 | 167 ± 7 | 160 ± 1 |
+| `get` `long` | 10M | 312 ± 6 | 298 ± 8 | 298 ± 17 |
+| `get` `dense` | 1M | 171 ± 2 | 159 ± 2 | 151 ± 1 |
+| `get` `dense` | 10M | 306 ± 11 | 296 ± 9 | 285 ± 3 |
+| `get` `uuid4` | 1M | 199 ± 8 | 183 ± 3 | 171 ± 2 |
+| `get` `uuid4` | 10M | 338 ± 27 | 306 ± 4 | 284 ± 1 |
+| `get` `uuid7` | 1M | 165 ± 11 | 164 ± 5 | 165 ± 11 |
+| `get` `uuid7` | 10M | 235 ± 2 | 238 ± 15 | 233 ± 1 |
+| `getMany` `long` | 1M | 84 ± 1 | 81 ± 1 | 87 ± 17 |
+| `getMany` `long` | 10M | 126 ± 2 | 121 ± 4 | 132 ± 2 |
+| `getMany` `uuid4` | 1M | 105 ± 6 | 96 ± 1 | 89 ± 1 |
+| `getMany` `uuid4` | 10M | 139 ± 3 | 136 ± 5 | 138 ± 5 |
+| insert `long` | 1M | 117 ± 3 | 144 ± 4 | 145 ± 3 |
+| insert `uuid4` | 1M | 117 ± 3 | 148 ± 3 | 144 ± 3 |
+| insert `uuid7` | 1M | 50 ± 1 | 64 ± 0 | 66 ± 1 |
 
-One node search with the windows in the L1 cache, a random node and a random target each time
-(`NodeSearchBenchmark`), in ns:
+- The 4-byte windows give `get` 0% to 7% over the 8-byte vector map. The rest of the gain comes
+  from the count with no branch: the scalar scan stops at a random place in each node, and the
+  CPU mispredicts that exit branch once on each level.
+- With the scalar scan, an earlier run gave 4-byte windows no gain for `get`, and `getMany` of
+  `long` keys was 13% to 16% slower. Thus the core map keeps 8-byte windows.
+- A count over the full capacity, with no loop bound from the count of the node, was 10% faster
+  at 1M keys and 8% slower at 10M `uuid4` keys. It reads the second cache line of the windows
+  every time. The count stops at the last live register.
+- The insert cost is the same with both window widths, so it comes from the vector count. It is
+  not analyzed yet.
 
-| Windows in the node | Scalar scan | Vector `SCAN` | Vector `COUNT` |
-|--:|--:|--:|--:|
-| 16 | 7.4 | 8.3 | 4.8 |
-| 32 | 9.6 | 8.4 | 7.7 |
-| 64 | 12.9 | 11.3 | 14.1 |
+[docs/vector-apple-silicon.md](docs/vector-apple-silicon.md) gives the review of the vector design
+for Apple silicon, with the node search measurements. On a CPU with 512-bit vectors (AVX-512), the
+result can be different. Run `GetBenchmark` with
+`-p impl=bbtree,bbtree-vector-count-wide,bbtree-vector-count` on that machine before you choose.
 
-The Vector API is an incubator module, so the core keeps the scalar scan. A larger gain needs
-narrower windows in inner nodes. [docs/vector-apple-silicon.md](docs/vector-apple-silicon.md)
-reviews the best vector design for Apple silicon, with measurements.
+## Java, Go and Rust
 
-On a CPU with 512-bit vectors (AVX-512, 8 `long` lanes), the result can be different. Run
-`NodeSearchBenchmark` and `GetBenchmark` with `-p impl=bbtree,bbtree-vector-scan,bbtree-vector-count`
-on that machine before you choose.
+[bbtree-go](https://github.com/richardartoul/bbtree-go) is a Go port of the Rust bbtree, with
+NEON assembly on arm64. Its `bench/main.go` and `bench/reference.rs` run the same workloads on Go
+and on Rust. `CrossLanguage` runs them on this port, with the same flags, keys, values and
+checksums. The checksums of the three agree on every operation. `cross-language.sh` builds the Go
+and Rust programs at pinned revisions and interleaves the three languages:
+
+```sh
+mvn -B package -DskipTests
+bbtree-benchmarks/cross-language.sh 6 > results.csv
+```
+
+Apple M5 Pro, Go 1.27.3, Rust 1.99.1 with `-C target-cpu=native`, Corretto 25.0.4 with an 8 GB
+heap. 1,048,576 entries, median of 6 rounds, ns per operation. Java runs the workload 5 times in
+one JVM and keeps the last time. "Java" is the scalar map (`LongBBTreeMap` for `uint64`), and
+"Java, vector" is the map of `bbtree-vector`.
+
+| Keys | Map | Operation | Threads | Rust | Go | Java | Java, vector | Best Java / Rust |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| `uint64` | single | insert | 1 | 76.4 | 91.0 | 118.9 | 143.5 | 1.56× |
+| `uint64` | single | hit | 1 | 36.7 | 42.8 | 156.0 | 154.7 | 4.21× |
+| `uint64` | single | miss | 1 | 32.1 | 33.8 | 96.9 | 99.9 | 3.02× |
+| `uint64` | single | batch hit | 1 | 22.4 | 22.7 | 102.7 | 87.1 | 3.89× |
+| `uint64` | single | delete | 1 | 84.9 | 90.5 | 150.4 | 176.7 | 1.77× |
+| `uint64` | single | scan of 64 | 1 | 204.4 | 198.6 | 1169.5 | 1246.2 | 5.72× |
+| `uint64` | concurrent | insert | 1 | 75.3 | 105.3 | 119.3 | 143.4 | 1.58× |
+| `uint64` | concurrent | hit | 1 | 37.6 | 58.0 | 158.6 | 152.2 | 4.05× |
+| `uint64` | concurrent | batch hit | 1 | 27.0 | 30.1 | 104.4 | 88.4 | 3.27× |
+| `uint64` | concurrent | insert | 8 | 29.0 | 50.0 | 29.6 | 33.0 | 1.02× |
+| `uint64` | concurrent | hit | 8 | 7.9 | 12.2 | 24.7 | 24.2 | 3.08× |
+| `uint64` | concurrent | 90% hits, 10% overwrites | 8 | 8.8 | 12.6 | 25.8 | 26.5 | 2.92× |
+| `string` | single | insert | 1 | 136.4 | 177.3 | 177.0 | 199.1 | 1.30× |
+| `string` | single | hit | 1 | 158.8 | 250.4 | 328.9 | 332.6 | 2.07× |
+| `string` | single | miss | 1 | 71.0 | 97.6 | 136.9 | 147.8 | 1.93× |
+| `string` | single | batch hit | 1 | 56.0 | 58.8 | 192.7 | 193.7 | 3.44× |
+| `string` | single | delete | 1 | 188.3 | 173.4 | 213.2 | 226.3 | 1.13× |
+| `string` | single | scan of 64 | 1 | 585.5 | 398.6 | 1150.9 | 1191.1 | 1.97× |
+| `string` | concurrent | insert | 1 | 140.3 | 243.8 | 176.6 | 194.4 | 1.26× |
+| `string` | concurrent | hit | 1 | 136.7 | 249.4 | 321.4 | 319.1 | 2.33× |
+| `string` | concurrent | batch hit | 1 | 63.5 | 78.6 | 191.5 | 193.4 | 3.01× |
+| `string` | concurrent | insert | 8 | 43.5 | 104.3 | 37.0 | 40.0 | 0.85× |
+| `string` | concurrent | hit | 8 | 24.1 | 35.9 | 47.6 | 47.9 | 1.97× |
+| `string` | concurrent | 90% hits, 10% overwrites | 8 | 31.1 | 36.6 | 48.1 | 49.0 | 1.55× |
+
+Differences in the workload:
+
+- Java has one map type, which is concurrent. In the `single` rows it runs on one thread, where
+  Rust uses its single-thread map and Go its `Map`.
+- Java values are `Long` objects. A hit reads the value object, where Go and Rust read a `u64`
+  in the leaf.
+- The Java scan uses the entry iterator, which makes one entry object for each entry.
+
+Java is close to Rust for inserts and deletes: 0.85 to 1.8 times the Rust time. With 8 threads,
+Java inserts are faster than Go, and `string` inserts are also faster than Rust. Lookups and
+scans take 1.6 to 5.7 times the Rust time. A large part of the gap comes from cache misses.
+At 65,536 entries, which stay in the cache, a `uint64` hit took 50 ns in Java and 21 ns in Rust.
+At 1M entries, it took 168 ns and 39 ns. The larger map thus added 118 ns in Java and 18 ns in
+Rust. A Java lookup reads more separate objects on each level: the node, its windows array and
+its children array, and at the end the value object. The node layout with fewer objects in
+"Possible next steps" addresses this.

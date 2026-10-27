@@ -50,6 +50,9 @@ class DifferentialTest {
         r -> Integer.toString(r.nextInt(5_000), 36) + (r.nextBoolean() ? "" : "\0");
     Function<Random, byte[]> bytes =
         r -> ("k" + r.nextInt(5_000)).getBytes(StandardCharsets.UTF_8);
+    // Keys that differ only in their low 4 bytes, so that the 4-byte inner windows tie.
+    Function<Random, Long> tiedLong =
+        r -> ((long) r.nextInt(3) << 32 | r.nextInt(4_000) * 997L) - (1L << 32);
     Function<Random, UUID> uuid = r -> new UUID(r.nextInt(3), r.nextInt(5_000));
     Function<Random, Integer> integer = r -> r.nextInt(5_000) * (r.nextBoolean() ? 1 : -1);
     Comparator<Long> longs = Comparator.naturalOrder();
@@ -58,6 +61,19 @@ class DifferentialTest {
         config("LONG 4/4", () -> new BBTreeMap<>(InlineKey.LONG, 4, 4), longs, smallLong),
         config("LONG default", () -> new BBTreeMap<>(InlineKey.LONG), longs, wideLong),
         config("LONG 7/5", () -> new BBTreeMap<>(InlineKey.LONG, 7, 5), longs, wideLong),
+        config("LONG 4/4 narrow ties", () -> narrow(InlineKey.LONG, 4, 4), longs, tiedLong),
+        config("LONG 5/6 narrow ties", () -> narrow(InlineKey.LONG, 5, 6), longs, tiedLong),
+        config("LONG 4/4 narrow", () -> narrow(InlineKey.LONG, 4, 4), longs, wideLong),
+        config(
+            "UUID 4/4 narrow",
+            () -> narrow(InlineKey.UUID, 4, 4),
+            Comparator.<UUID>naturalOrder(),
+            uuid),
+        config(
+            "STRING 4/4 narrow inner",
+            () -> narrow(InlineKey.STRING, 4, 4),
+            strings,
+            url),
         config("natural Long 4/4", () -> new BBTreeMap<>(longs, null, 4, 4), longs, smallLong),
         config("natural Long default", BBTreeMap::new, longs, wideLong),
         config("STRING 4/4", () -> new BBTreeMap<>(InlineKey.STRING, 4, 4), strings, url),
@@ -77,6 +93,11 @@ class DifferentialTest {
             () -> new BBTreeMap<>(InlineKey.INTEGER, 6, 4),
             Comparator.<Integer>naturalOrder(),
             integer));
+  }
+
+  /** Makes a map with 4-byte inner windows and the scalar scan. */
+  private static <K> BBTreeMap<K, Integer> narrow(InlineKey<K> inline, int leaf, int inner) {
+    return new BBTreeMap<>(inline, inline, leaf, inner, WindowScan.SCALAR, true);
   }
 
   private static <K> Arguments config(
@@ -127,6 +148,9 @@ class DifferentialTest {
             expected.replace(key, guess, value), map.replace(key, guess, value), at);
       } else if (dice < 98) {
         assertEquals(expected.get(key), map.get(key), at);
+        if (map.hasLongKeys()) {
+          assertEquals(expected.get(key), map.getLong((Long) key), at + " getLong");
+        }
         assertEquals(show(expected.ceilingKey(key)), show(map.ceilingKey(key)), at);
       } else {
         checkRange(map, expected, config.key().apply(random), key, random, at);
@@ -174,6 +198,12 @@ class DifferentialTest {
     assertEntries(expected, map.entrySet().iterator(), at);
     for (Map.Entry<K, Integer> e : expected.entrySet()) {
       assertEquals(e.getValue(), map.get(e.getKey()), at);
+    }
+    if (map.hasLongKeys()) {
+      long[] keys = expected.keySet().stream().mapToLong(k -> (Long) k).toArray();
+      Object[] values = new Object[keys.length];
+      map.getManyLong(keys, values);
+      assertEquals(new ArrayList<>(expected.values()), Arrays.asList(values), at + " getManyLong");
     }
     if (!expected.isEmpty()) {
       assertEquals(expected.firstKey(), map.firstKey(), at);

@@ -15,6 +15,15 @@ final class Keys {
 
   /** Gives {@code n} distinct keys of a type in random order. */
   static Object[] distinct(String keyType, int n, long seed) {
+    if (keyType.equals("dense")) {
+      // The integers 0 to n - 1, as the IDs of a table.
+      Object[] keys = new Object[n];
+      for (int i = 0; i < n; i++) {
+        keys[i] = (long) i;
+      }
+      shuffle(keys, seed);
+      return keys;
+    }
     SplittableRandom random = new SplittableRandom(seed);
     clock = UUID7_START_MILLIS;
     java.util.Set<Object> seen = new java.util.HashSet<>(2 * n);

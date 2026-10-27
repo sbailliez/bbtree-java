@@ -9,8 +9,8 @@ public final class KeySets {
   private KeySets() {}
 
   /**
-   * Makes a bbtree map with inline keys, filled with {@code size} distinct keys of a type, in
-   * the order that the benchmarks use.
+   * Makes a bbtree map with inline keys and 8-byte windows in all nodes, filled with {@code
+   * size} distinct keys of a type, in the order that the benchmarks use.
    *
    * @param keyType long, uuid4, uuid7 or string
    * @param size the number of keys

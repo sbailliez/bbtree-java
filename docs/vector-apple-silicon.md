@@ -1,8 +1,8 @@
 # A vector node search for Apple silicon
 
 This review answers one question: what node search with the Java Vector API gives the best
-lookup speed on Apple silicon? It is a design review with measurements. The map does not
-implement the result yet.
+lookup speed on Apple silicon? It is a design review with measurements. The module
+`bbtree-vector` implements the 4-byte inner windows. The last section gives the measured result.
 
 ## Summary
 
@@ -189,6 +189,42 @@ This is an estimate from a microbenchmark. The real gain depends on:
 - the size of the methods, because the JIT must still inline the search.
 
 Measure it in the map before you keep it.
+
+## The implementation and the measured gain
+
+`VectorBBTreeMaps` makes maps with this design for `LONG`, `INTEGER` and `UUID`:
+
+- Each inner node keeps its 8-byte windows and also an `int[]` of 4-byte windows. The tail slots
+  of the `int[]` hold `Integer.MAX_VALUE`, and its length is a multiple of 64.
+- The count subtracts the masks into lane counters and adds the lanes one time, as the Rust
+  bbtree does. It stops after the register that holds the last live slot.
+- Only an inner node with two fences searches the 4-byte windows. The root and the border nodes
+  have a prefix of 0, because they have no fence on one side. With 4-byte windows, dense keys
+  tied on every separator there: a test of 100,020 lookups of the integers 0 to 99,999 made
+  373,950 key compares. With the 8-byte windows at the borders, it makes 0.
+- The leaves keep 8-byte windows. Their count also adds the lanes one time.
+
+Measured `get` in ns, 4 forks (the README gives the full table):
+
+| Keys | Size | Scalar | Vector, 8-byte inner windows | Vector, 4-byte inner windows |
+|---|--:|--:|--:|--:|
+| `long` | 1M | 206 | 167 | 160 |
+| `long` | 10M | 312 | 298 | 298 |
+| `uuid4` | 1M | 199 | 183 | 171 |
+| `uuid4` | 10M | 338 | 306 | 284 |
+
+The estimate in the section "Estimated gain" was approximately 5% for the 4-byte windows at 1M
+keys. The measured gain over the 8-byte vector map is 0% to 7% at 1M and 10M keys. The count with
+no branch gives the larger part of the gain over the scalar map.
+
+Two results of the implementation differ from the recommendation:
+
+- **The count does not compare the full capacity.** A count over all 64 slots was 10% faster at
+  1M keys, but 8% slower at 10M `uuid4` keys. 64 windows of 4 bytes take two 128-byte lines.
+  The full count always reads both. The count to the last live slot reads the second line only
+  when the node has more than 32 separators.
+- **The vector maps make inserts 23% to 33% slower than the scalar map**, with both window
+  widths. The cause is not analyzed yet.
 
 ## How to run the measurements
 

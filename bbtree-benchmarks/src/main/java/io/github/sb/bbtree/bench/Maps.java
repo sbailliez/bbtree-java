@@ -1,6 +1,7 @@
 package io.github.sb.bbtree.bench;
 
 import io.github.sb.bbtree.BBTreeMap;
+import io.github.sb.bbtree.BenchMaps;
 import io.github.sb.bbtree.InlineKey;
 import io.github.sb.bbtree.VectorBBTreeMaps;
 import java.util.Map;
@@ -16,7 +17,9 @@ final class Maps {
   static Map<Object, Object> create(String impl, String keyType) {
     return switch (impl) {
       case "bbtree" -> (Map) new BBTreeMap<>(inlineKey(keyType));
+      case "bbtree-narrow" -> (Map) BenchMaps.create(inlineKey(keyType), false, true);
       case "bbtree-noinline" -> new BBTreeMap<>();
+      case "bbtree-vector-count-wide" -> (Map) BenchMaps.create(inlineKey(keyType), true, false);
       case "bbtree-vector-count" ->
           (Map) VectorBBTreeMaps.create(inlineKey(keyType), VectorBBTreeMaps.Mode.COUNT);
       case "bbtree-vector-scan" ->
@@ -44,7 +47,7 @@ final class Maps {
 
   private static InlineKey<?> inlineKey(String keyType) {
     return switch (keyType) {
-      case "long" -> InlineKey.LONG;
+      case "long", "dense" -> InlineKey.LONG;
       case "string" -> InlineKey.STRING;
       case "uuid4", "uuid7" -> InlineKey.UUID;
       default -> throw new IllegalArgumentException("unknown key type " + keyType);
