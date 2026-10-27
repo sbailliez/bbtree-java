@@ -19,9 +19,10 @@ import java.util.function.BiConsumer;
  *
  * <p><b>Search.</b> If you give the map an {@link InlineKey}, each node keeps a {@code long}
  * window of each key, taken right after the encoding prefix that all keys of the node share. The
- * node prefix comes from the two separators around the node in its parent, so no node stores it.
- * A node search counts the windows that are smaller than the window of the target, with no
- * branch in the loop. The map reads a key object only when two windows tie. For keys of a fixed
+ * prefix is the common prefix of the two fences of the node: the separators around it in its
+ * parent. Thus a node keeps only the length of its prefix, not the prefix bytes. A node search
+ * scans the sorted windows up to the first one that is not smaller than the window of the
+ * target. The map reads a key object only when two windows tie. For keys of a fixed
  * length that the window covers, such as {@link Long}, a tie is a match and the map reads no key
  * object at all.
  *
@@ -39,9 +40,10 @@ import java.util.function.BiConsumer;
  * they give each entry that was present for the full iteration. {@link #size()} is exact when no
  * write runs at the same time.
  *
- * <p><b>Removal.</b> A removal that empties a leaf unlinks the leaf when the leaf has a left
- * sibling in the same parent. The map does not merge leaves that are not empty, and the tree
- * height does not decrease.
+ * <p><b>Removal.</b> A removal that empties a leaf removes the empty nodes on its path: an empty
+ * leaf merges with a sibling, an empty inner node gives its only child to a sibling, and a root
+ * with one child gives its place to the child. This is best effort under contention. The map does
+ * not merge nodes that are not empty.
  *
  * @param <K> the key type
  * @param <V> the value type
@@ -150,44 +152,43 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   }
 
   /**
-   * Counts the windows that are smaller than {@code target} and the windows that are not larger.
-   * The loop has no branch, so the JIT can use conditional moves or SIMD.
-   *
-   * @return the first count in the high 32 bits and the second count in the low 32 bits
-   */
-  private static long countWindows(long[] windows, int n, long target) {
-    int lt = 0;
-    int le = 0;
-    for (int i = 0; i < n; i++) {
-      long w = windows[i];
-      lt += w < target ? 1 : 0;
-      le += w <= target ? 1 : 0;
-    }
-    return ((long) lt << 32) | le;
-  }
-
-  /**
    * Finds {@code key} in a leaf.
+   *
+   * <p>The scan over the windows stops at the first window that is not smaller than the target.
+   * A count of all windows with no branch does more work: C2 does not vectorize it on AArch64,
+   * and the early exit was 11 to 22% faster for {@code get} in JMH. The windows are sorted, so
+   * the scan finds the same index. The comparator runs in a separate method, so that this method
+   * stays small enough for the JIT to inline the {@link InlineKey} call.
    *
    * @return the index of the key, or {@code -(insertion point) - 1} if the leaf does not have it
    */
-  @SuppressWarnings("unchecked")
   private int find(Node node, K key) {
-    Object[] keys = node.keys;
-    int n = Math.min(node.count, keys.length);
-    int lo = 0;
-    int hi = n;
-    if (inline != null) {
-      long counts = countWindows(node.windows, n, window(key, node.prefix));
-      lo = (int) (counts >>> 32);
-      hi = (int) counts;
-      if (lo == hi) {
-        return -lo - 1;
-      }
-      if (node.prefix >= exactFrom) {
-        return lo;
-      }
+    long[] w = node.windows;
+    if (w == null) {
+      return findKey(node.keys, 0, Math.min(node.count, node.keys.length), key);
     }
+    int n = Math.min(node.count, w.length);
+    long t = window(key, node.prefix);
+    int lo = 0;
+    while (lo < n && w[lo] < t) {
+      lo++;
+    }
+    int hi = lo;
+    while (hi < n && w[hi] == t) {
+      hi++;
+    }
+    if (lo == hi) {
+      return -lo - 1;
+    }
+    if (node.prefix >= exactFrom) {
+      return lo;
+    }
+    return findKey(node.keys, lo, hi, key);
+  }
+
+  /** Searches {@code keys[lo, hi)} with the comparator. Gives the same result as {@link #find}. */
+  @SuppressWarnings("unchecked")
+  private int findKey(Object[] keys, int lo, int hi, K key) {
     while (lo < hi) {
       int mid = (lo + hi) >>> 1;
       int c = comparator.compare((K) keys[mid], key);
@@ -203,21 +204,33 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   }
 
   /** Gives the index of the child of an inner node that holds {@code key}. */
-  @SuppressWarnings("unchecked")
   private int childIndex(Inner node, K key) {
-    Object[] keys = node.keys;
-    int n = Math.min(node.count, keys.length);
-    int lo = 0;
-    int hi = n;
-    if (inline != null) {
-      long counts = countWindows(node.windows, n, window(key, node.prefix));
-      lo = (int) (counts >>> 32);
-      hi = (int) counts;
-      if (lo == hi || node.prefix >= exactFrom) {
-        return hi;
-      }
+    long[] w = node.windows;
+    if (w == null) {
+      return upperBound(node.keys, 0, Math.min(node.count, node.keys.length), key);
     }
-    // The number of separators that are not larger than the key.
+    int n = Math.min(node.count, w.length);
+    long t = window(key, node.prefix);
+    int lo = 0;
+    while (lo < n && w[lo] < t) {
+      lo++;
+    }
+    int hi = lo;
+    while (hi < n && w[hi] == t) {
+      hi++;
+    }
+    if (lo == hi || node.prefix >= exactFrom) {
+      return hi;
+    }
+    return upperBound(node.keys, lo, hi, key);
+  }
+
+  /**
+   * Gives {@code lo} plus the number of keys in {@code keys[lo, hi)} that are not larger than
+   * {@code key}. The keys before {@code lo} are smaller than {@code key}.
+   */
+  @SuppressWarnings("unchecked")
+  private int upperBound(Object[] keys, int lo, int hi, K key) {
     while (lo < hi) {
       int mid = (lo + hi) >>> 1;
       if (comparator.compare((K) keys[mid], key) <= 0) {
@@ -279,6 +292,12 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
    * Looks up many keys at the same time. The lookups go down the tree one level at a time,
    * together, so that the CPU waits for the cache misses of different lookups in parallel.
    *
+   * <p>Java has no prefetch instruction, and an acquire load keeps later loads from starting
+   * before it. Thus each level has three passes: a search of every lane with plain loads, a plain
+   * load of every child that starts its cache miss, and then the version reads and validations,
+   * which find the children in the cache. A lane that does not validate, or that meets an
+   * exception, falls back to {@link #get}.
+   *
    * @param keys the keys to look up, none {@code null}
    * @param results the array that receives the value of {@code keys[i]} at index {@code i}, or
    *     {@code null} if the map does not have the key; at least as long as {@code keys}
@@ -290,11 +309,18 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     }
     int lanes = Math.min(BATCH_LANES, keys.length);
     Node[] nodes = new Node[lanes];
+    Node[] children = new Node[lanes];
     long[] versions = new long[lanes];
+    // The sum of the loads that only start cache misses. The final check keeps the JIT from
+    // removing them.
+    long touched = 0;
     for (int start = 0; start < keys.length; start += lanes) {
       int n = Math.min(lanes, keys.length - start);
       for (int j = 0; j < n; j++) {
-        Objects.requireNonNull(keys[start + j]);
+        K k = Objects.requireNonNull(keys[start + j]);
+        if (inline != null) {
+          touched += inline.window(k, 0) & 1;
+        }
       }
       Node top = root;
       long tv = top.version();
@@ -310,58 +336,83 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       boolean inner = top instanceof Inner;
       while (inner) {
         for (int j = 0; j < n; j++) {
-          nodes[j] = descendOne(nodes[j], versions, j, keys[start + j]);
+          children[j] = childOf(nodes[j], keys[start + j]);
+        }
+        for (int j = 0; j < n; j++) {
+          touched += touch(children[j]);
         }
         inner = false;
         for (int j = 0; j < n; j++) {
-          if (nodes[j] instanceof Inner) {
-            inner = true;
-            break;
+          Node parent = nodes[j];
+          Node child = children[j];
+          nodes[j] = null;
+          if (child != null) {
+            long cv = child.version();
+            if (!Node.isLocked(cv) && parent.validate(versions[j])) {
+              nodes[j] = child;
+              versions[j] = cv;
+              inner |= child instanceof Inner;
+            }
           }
         }
       }
       for (int j = 0; j < n; j++) {
-        K k = keys[start + j];
-        Object value = null;
-        boolean valid = false;
-        if (nodes[j] instanceof Leaf leaf) {
-          try {
-            int pos = find(leaf, k);
-            value = pos >= 0 ? leaf.values[pos] : null;
-            valid = leaf.validate(versions[j]);
-          } catch (RuntimeException e) {
-            if (leaf.validate(versions[j])) {
-              throw e;
-            }
-          }
+        Object value = valueIn(nodes[j], keys[start + j]);
+        if (value == FAILED) {
+          nodes[j] = null;
+          value = null;
         }
-        results[start + j] = valid ? (V) value : get(k);
+        results[start + j] = (V) value;
       }
+      for (int j = 0; j < n; j++) {
+        if (!(nodes[j] instanceof Leaf leaf) || !leaf.validate(versions[j])) {
+          results[start + j] = get(keys[start + j]);
+        }
+      }
+    }
+    if (touched < 0) {
+      throw new AssertionError(touched);
     }
   }
 
-  /**
-   * Moves one lane of {@link #getMany} down one level. Gives {@code null} if the read was not
-   * valid. The lane then falls back to {@link #get}.
-   */
-  private Node descendOne(Node node, long[] versions, int lane, K key) {
+  /** Gives the child of an inner node for {@code key}, or {@code null} if the read failed. */
+  private Node childOf(Node node, K key) {
     if (!(node instanceof Inner inner)) {
       return null;
     }
-    long v = versions[lane];
     try {
-      Node child = inner.children[childIndex(inner, key)];
-      long cv = child.version();
-      if (Node.isLocked(cv) || !inner.validate(v)) {
-        return null;
-      }
-      versions[lane] = cv;
-      return child;
+      return inner.children[childIndex(inner, key)];
     } catch (RuntimeException e) {
-      if (inner.validate(v)) {
-        throw e;
-      }
+      // get repeats the read, and throws if the exception was not a stale read.
       return null;
+    }
+  }
+
+  /** Loads the header of a node and the first line of its windows, to start the cache misses. */
+  private static long touch(Node node) {
+    if (node == null) {
+      return 0;
+    }
+    long[] w = node.windows;
+    return (node.count & 1) + (w != null ? w[0] & 1 : 0);
+  }
+
+  /** The result of {@link #valueIn} when the read threw. */
+  private static final Object FAILED = new Object();
+
+  /**
+   * Reads the value of {@code key} in a leaf. Gives {@link #FAILED} if the read threw: the lane
+   * then falls back to {@link #get}, which throws if the exception was not a stale read.
+   */
+  private Object valueIn(Node node, K key) {
+    if (!(node instanceof Leaf leaf)) {
+      return null;
+    }
+    try {
+      int pos = find(leaf, key);
+      return pos >= 0 ? leaf.values[pos] : null;
+    } catch (RuntimeException e) {
+      return FAILED;
     }
   }
 
@@ -369,8 +420,16 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   // Writes
 
   /**
-   * Locks and gives the leaf that holds {@code key}. If {@code forInsert} is {@code true}, the
-   * leaf has room for one more entry or already has the key. The caller must unlock the leaf.
+   * Locks and gives the leaf that holds {@code key}. The caller must unlock it.
+   *
+   * <p>If {@code forInsert} is {@code true}, the leaf has room for one more entry or already has
+   * the key. Full nodes on the way split first. If {@code forInsert} is {@code false}, the leaf
+   * has the key: if it does not, the method gives {@code null} and locks nothing, so that an
+   * update of an absent key writes no shared memory.
+   *
+   * <p>An exception from the comparator or the {@link InlineKey} goes to the caller, with no lock
+   * held. An exception during an optimistic read that did not validate is a stale read, and the
+   * descent starts again.
    */
   private Leaf lockLeaf(K key, boolean forInsert) {
     restart:
@@ -388,9 +447,8 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         while (node instanceof Inner inner) {
           if (forInsert && inner.count >= inner.capacity()) {
             // Split a full inner node on the way down, so that a split below always has room
-            // in its parent.
-            trySplit(parent, pv, slot, inner, v, key);
-            continue restart;
+            // in its parent. The split runs outside this try block.
+            break;
           }
           int i = childIndex(inner, key);
           Node child = inner.children[i];
@@ -405,153 +463,257 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
           node = child;
           v = cv;
         }
-        Leaf leaf = (Leaf) node;
-        if (forInsert && leaf.count >= leaf.capacity()) {
-          boolean present = find(leaf, key) >= 0;
-          if (!leaf.validate(v)) {
-            continue;
+        if (node instanceof Leaf leaf) {
+          boolean needsRoom = forInsert && leaf.count >= leaf.capacity();
+          if (needsRoom || !forInsert) {
+            boolean present = find(leaf, key) >= 0;
+            if (!leaf.validate(v)) {
+              continue;
+            }
+            if (!forInsert && !present) {
+              return null;
+            }
+            needsRoom &= !present;
           }
-          if (!present) {
-            trySplit(parent, pv, slot, leaf, v, key);
+          if (!needsRoom) {
+            if (leaf.tryUpgrade(v)) {
+              return leaf;
+            }
+            Thread.onSpinWait();
             continue;
           }
         }
-        if (leaf.tryUpgrade(v)) {
-          return leaf;
-        }
-        Thread.onSpinWait();
       } catch (RuntimeException e) {
         if (node.validate(v)) {
           throw e;
         }
+        continue;
       }
+      trySplit(parent, pv, slot, node, v, key);
     }
   }
 
   /**
    * Splits {@code node} for the insert of {@code key}, if neither the node nor its parent changed
    * since the versions that the caller read. Does nothing if one of them changed: the caller
-   * starts again from the root.
+   * starts again from the root. An exception leaves the tree as it was, with no lock held.
    */
   private void trySplit(Inner parent, long pv, int slot, Node node, long v, K key) {
     if (parent == null) {
       if (!node.tryUpgrade(v)) {
         return;
       }
-      if (root != node) {
+      try {
+        if (root != node) {
+          return;
+        }
+        Split split = prepareSplit(node, key, 0);
+        Inner top = new Inner(innerCapacity, inline != null);
+        split.commit();
+        top.children[0] = node;
+        top.children[1] = split.right;
+        top.keys[0] = split.separator;
+        if (inline != null) {
+          top.windows[0] = split.separatorWindow;
+        }
+        top.count = 1;
+        root = top;
+      } finally {
         node.unlock();
-        return;
       }
-      Node right = split(node, key);
-      Inner top = new Inner(innerCapacity, inline != null);
-      top.children[0] = node;
-      insertChild(top, 0, right.low, right);
-      root = top;
-      node.unlock();
       return;
     }
     if (!parent.tryUpgrade(pv)) {
       return;
     }
-    if (!node.tryUpgrade(v)) {
+    try {
+      if (!node.tryUpgrade(v)) {
+        return;
+      }
+      try {
+        Split split = prepareSplit(node, key, parent.prefix);
+        split.commit();
+        insertChild(parent, slot, split.separator, split.separatorWindow, split.right);
+      } finally {
+        node.unlock();
+      }
+    } finally {
       parent.unlock();
-      return;
     }
-    Node right = split(node, key);
-    insertChild(parent, slot, right.low, right);
-    node.unlock();
-    parent.unlock();
   }
 
   /**
-   * Moves the upper half of a locked node into a new node and gives it. If {@code key} goes after
-   * the last key of the last node of its level, the keys arrive in ascending order, as
-   * time-ordered IDs do. Then the split moves only the last key, and leaves the left node full.
+   * A split that is ready to apply. {@link #prepareSplit} runs all user code and all allocations,
+   * and changes nothing that another thread can see. {@link #commit} only moves references and
+   * cannot throw, so a failure never leaves a half-split node.
    */
-  private Node split(Node node, K key) {
-    @SuppressWarnings("unchecked")
-    boolean append =
-        node.high == null && comparator.compare(key, (K) node.keys[node.count - 1]) > 0;
-    if (node instanceof Leaf leaf) {
-      return splitLeaf(leaf, append ? leaf.count - 1 : leaf.count >>> 1);
+  private final class Split {
+    final Node left;
+    final Node right;
+    final int mid;
+    final Object separator;
+    final long separatorWindow;
+    final int leftPrefix;
+
+    /** The new windows of the left node, or {@code null} if its prefix does not change. */
+    final long[] leftWindows;
+
+    Split(Node left, Node right, int mid, Object separator, long separatorWindow) {
+      this.left = left;
+      this.right = right;
+      this.mid = mid;
+      this.separator = separator;
+      this.separatorWindow = separatorWindow;
+      this.leftPrefix = prefixOf(left.low, separator);
+      this.leftWindows =
+          leftPrefix == left.prefix ? null : windowsAfterSplit(left, 0, mid, leftPrefix);
     }
-    return splitInner((Inner) node, append ? node.count - 2 : node.count >>> 1);
-  }
 
-  /** Moves the entries from index {@code mid} on into a new right leaf. */
-  private Leaf splitLeaf(Leaf leaf, int mid) {
-    Leaf right = new Leaf(leafCapacity, inline != null);
-    int n = leaf.count;
-    int m = n - mid;
-    System.arraycopy(leaf.keys, mid, right.keys, 0, m);
-    System.arraycopy(leaf.values, mid, right.values, 0, m);
-    Arrays.fill(leaf.keys, mid, n, null);
-    Arrays.fill(leaf.values, mid, n, null);
-    right.count = m;
-    leaf.count = mid;
-    right.low = right.keys[0];
-    right.high = leaf.high;
-    leaf.high = right.low;
-    right.next = leaf.next;
-    refit(leaf);
-    refit(right);
-    leaf.next = right;
-    return right;
-  }
-
-  /** Moves separator {@code mid} up, and the separators after it into a new right node. */
-  private Inner splitInner(Inner inner, int mid) {
-    Inner right = new Inner(innerCapacity, inline != null);
-    int n = inner.count;
-    int m = n - mid - 1;
-    Object separator = inner.keys[mid];
-    System.arraycopy(inner.keys, mid + 1, right.keys, 0, m);
-    System.arraycopy(inner.children, mid + 1, right.children, 0, m + 1);
-    Arrays.fill(inner.keys, mid, n, null);
-    Arrays.fill(inner.children, mid + 1, n + 1, null);
-    right.count = m;
-    inner.count = mid;
-    right.low = separator;
-    right.high = inner.high;
-    inner.high = separator;
-    refit(inner);
-    refit(right);
-    return right;
+    void commit() {
+      int n = left.count;
+      if (left instanceof Leaf leaf) {
+        Arrays.fill(leaf.keys, mid, n, null);
+        Arrays.fill(leaf.values, mid, n, null);
+        leaf.next = (Leaf) right;
+      } else {
+        Inner inner = (Inner) left;
+        Arrays.fill(inner.keys, mid, n, null);
+        Arrays.fill(inner.children, mid + 1, n + 1, null);
+      }
+      left.count = mid;
+      left.high = separator;
+      setPrefix(left, leftPrefix, leftWindows);
+    }
   }
 
   /**
-   * Computes the prefix of a node from its fences, and the windows of its keys from the prefix.
-   * A node that is open on one side has no prefix.
+   * Prepares the split of a locked, full node. The new right node takes the upper half. If
+   * {@code key} goes after the last key of the last node of its level, the keys arrive in
+   * ascending order, as time-ordered IDs do. Then the split moves only the last key, and leaves
+   * the left node full.
+   *
+   * @param parentPrefix the prefix of the node that receives the separator
    */
   @SuppressWarnings("unchecked")
-  private void refit(Node node) {
-    if (inline == null) {
-      return;
+  private Split prepareSplit(Node node, K key, int parentPrefix) {
+    int n = node.count;
+    boolean append = node.high == null && comparator.compare(key, (K) node.keys[n - 1]) > 0;
+    Node right;
+    int mid;
+    Object separator;
+    if (node instanceof Leaf leaf) {
+      mid = append ? n - 1 : n >>> 1;
+      Leaf r = new Leaf(leafCapacity, inline != null);
+      System.arraycopy(leaf.keys, mid, r.keys, 0, n - mid);
+      System.arraycopy(leaf.values, mid, r.values, 0, n - mid);
+      r.count = n - mid;
+      r.next = leaf.next;
+      separator = r.keys[0];
+      right = r;
+    } else {
+      Inner inner = (Inner) node;
+      mid = append ? n - 2 : n >>> 1;
+      Inner r = new Inner(innerCapacity, inline != null);
+      System.arraycopy(inner.keys, mid + 1, r.keys, 0, n - mid - 1);
+      System.arraycopy(inner.children, mid + 1, r.children, 0, n - mid);
+      r.count = n - mid - 1;
+      separator = inner.keys[mid];
+      right = r;
     }
-    int prefix =
-        node.low == null || node.high == null
-            ? 0
-            : inline.commonPrefix((K) node.low, (K) node.high);
+    right.low = separator;
+    right.high = node.high;
+    int rightPrefix = prefixOf(right.low, right.high);
+    int from = node instanceof Leaf ? mid : mid + 1;
+    setPrefix(right, rightPrefix, windowsAfterSplit(node, from, right.count, rightPrefix));
+    long separatorWindow = inline != null ? window((K) separator, parentPrefix) : 0L;
+    return new Split(node, right, mid, separator, separatorWindow);
+  }
+
+  /** Gives the prefix of a node with these fences. A node open on one side has no prefix. */
+  @SuppressWarnings("unchecked")
+  private int prefixOf(Object low, Object high) {
+    return inline == null || low == null || high == null
+        ? 0
+        : inline.commonPrefix((K) low, (K) high);
+  }
+
+  /**
+   * Gives the windows of {@code node.keys[from, from + n)} at a new prefix, from index 0, for a
+   * half of a split. A split never makes a prefix shorter. If the old windows hold the whole rest
+   * of each key, as for fixed-length keys such as {@link Long}, the new windows are the old ones
+   * shifted, and no key object is read. Otherwise the windows come from the keys.
+   */
+  private long[] windowsAfterSplit(Node node, int from, int n, int prefix) {
+    if (inline == null) {
+      return null;
+    }
+    if (node.prefix < exactFrom || prefix < node.prefix) {
+      return windowsOf(node.keys, from, n, prefix);
+    }
+    int bits = (prefix - node.prefix) << 3;
+    long[] windows = new long[node.capacity()];
+    for (int i = 0; i < n; i++) {
+      long w = node.windows[from + i] ^ Long.MIN_VALUE;
+      windows[i] = (bits >= Long.SIZE ? 0L : w << bits) ^ Long.MIN_VALUE;
+    }
+    return windows;
+  }
+
+  /** Computes the windows of the first {@code n} keys, or gives {@code null} without inline keys. */
+  private long[] windowsOf(Object[] keys, int n, int prefix) {
+    return windowsOf(keys, 0, n, prefix);
+  }
+
+  /**
+   * Computes the windows of {@code keys[from, from + n)} from index 0, or gives {@code null}
+   * without inline keys.
+   */
+  @SuppressWarnings("unchecked")
+  private long[] windowsOf(Object[] keys, int from, int n, int prefix) {
+    if (inline == null) {
+      return null;
+    }
+    long[] windows = new long[keys.length];
+    for (int i = 0; i < n; i++) {
+      windows[i] = window((K) keys[from + i], prefix);
+    }
+    return windows;
+  }
+
+  /** Sets the prefix of a locked node, and its windows if {@code windows} is not {@code null}. */
+  private static void setPrefix(Node node, int prefix, long[] windows) {
     node.prefix = prefix;
-    for (int i = 0; i < node.count; i++) {
-      node.windows[i] = window((K) node.keys[i], prefix);
+    if (windows != null) {
+      System.arraycopy(windows, 0, node.windows, 0, node.count);
     }
   }
 
   /** Puts {@code separator} at index {@code slot} of a locked inner node, with {@code right}. */
-  @SuppressWarnings("unchecked")
-  private void insertChild(Inner node, int slot, Object separator, Node right) {
+  private static void insertChild(
+      Inner node, int slot, Object separator, long separatorWindow, Node right) {
     int n = node.count;
-    long w = inline != null ? window((K) separator, node.prefix) : 0L;
     System.arraycopy(node.keys, slot, node.keys, slot + 1, n - slot);
     System.arraycopy(node.children, slot + 1, node.children, slot + 2, n - slot);
     node.keys[slot] = separator;
     node.children[slot + 1] = right;
-    if (inline != null) {
+    if (node.windows != null) {
       System.arraycopy(node.windows, slot, node.windows, slot + 1, n - slot);
-      node.windows[slot] = w;
+      node.windows[slot] = separatorWindow;
     }
     node.count = n + 1;
+  }
+
+  /** Removes separator {@code keyIndex} and child {@code childIndex} from a locked inner node. */
+  private static void removeChild(Inner node, int keyIndex, int childIndex) {
+    int n = node.count;
+    System.arraycopy(node.keys, keyIndex + 1, node.keys, keyIndex, n - keyIndex - 1);
+    System.arraycopy(node.children, childIndex + 1, node.children, childIndex, n - childIndex);
+    if (node.windows != null) {
+      System.arraycopy(node.windows, keyIndex + 1, node.windows, keyIndex, n - keyIndex - 1);
+    }
+    node.keys[n - 1] = null;
+    node.children[n] = null;
+    node.count = n - 1;
   }
 
   /** Puts an entry at index {@code pos} of a locked leaf that has room. */
@@ -587,6 +749,11 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     Objects.requireNonNull(value);
     Leaf leaf = lockLeaf(key, true);
     try {
+      if (leaf.count == 0) {
+        // As in TreeMap: the first key of an empty leaf meets the comparator too, so that a key
+        // of a wrong type fails now and not at the next put.
+        comparator.compare(key, key);
+      }
       int pos = find(leaf, key);
       if (pos >= 0) {
         @SuppressWarnings("unchecked")
@@ -620,6 +787,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
    */
   private V doRemove(K key, Object expected) {
     Leaf leaf = lockLeaf(key, false);
+    if (leaf == null) {
+      return null;
+    }
     V old;
     boolean empty;
     try {
@@ -640,7 +810,12 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     }
     size.decrement();
     if (empty) {
-      unlinkEmptyLeaf(key);
+      try {
+        compact(key);
+      } catch (RuntimeException e) {
+        // The removal is done. Compaction is optional, and it changes nothing when user code
+        // throws in it, so the removal does not fail: the empty node stays in the tree.
+      }
     }
     return old;
   }
@@ -652,13 +827,17 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
 
   @Override
   public boolean remove(Object key, Object value) {
-    return value != null && doRemove(key(key), value) != null;
+    K k = key(key);
+    return value != null && doRemove(k, value) != null;
   }
 
   @Override
   public V replace(K key, V value) {
     Objects.requireNonNull(value);
     Leaf leaf = lockLeaf(key(key), false);
+    if (leaf == null) {
+      return null;
+    }
     try {
       int pos = find(leaf, key);
       if (pos < 0) {
@@ -678,6 +857,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     Objects.requireNonNull(oldValue);
     Objects.requireNonNull(newValue);
     Leaf leaf = lockLeaf(key(key), false);
+    if (leaf == null) {
+      return false;
+    }
     try {
       int pos = find(leaf, key);
       if (pos < 0 || !oldValue.equals(leaf.values[pos])) {
@@ -690,79 +872,265 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     }
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Compaction
+
+  /** The most passes of {@link #compact} after one removal. */
+  private static final int COMPACT_PASSES = 64;
+
   /**
-   * Unlinks the leaf of {@code key} if it is empty and has a left sibling in the same parent. The
-   * left sibling takes over the key range of the empty leaf. The unlinked leaf stays locked for
-   * ever, so that every reader that still holds it starts again. This is best effort: if a node
-   * changed, the leaf stays in the tree.
+   * Removes the empty nodes on the path of {@code key}, after a removal emptied a leaf. Each pass
+   * goes down the path and removes the first empty node that has a sibling in the same parent,
+   * or makes the tree lower if the root has one child. An empty leaf merges with its sibling. An
+   * empty inner node gives its only child to its sibling. The removed node stays locked for
+   * ever, so that every reader that still holds it starts again.
+   *
+   * <p>This is best effort: if a node changes during a pass, the pass stops, and the empty node
+   * stays until a later removal on its path. The map does not merge nodes that are not empty.
    */
-  private void unlinkEmptyLeaf(K key) {
-    Node node = root;
-    long v = node.version();
-    if (Node.isLocked(v) || node != root) {
-      return;
-    }
-    Inner parent = null;
-    long pv = 0;
-    int slot = 0;
-    try {
-      while (node instanceof Inner inner) {
-        int i = childIndex(inner, key);
-        Node child = inner.children[i];
-        long cv = child.version();
-        if (Node.isLocked(cv) || !inner.validate(v)) {
-          return;
-        }
-        parent = inner;
-        pv = v;
-        slot = i;
-        node = child;
-        v = cv;
-      }
-      if (parent == null || slot == 0 || node.count != 0) {
+  private void compact(K key) {
+    for (int pass = 0; pass < COMPACT_PASSES; pass++) {
+      if (!compactOnce(key)) {
         return;
-      }
-      Leaf prev = (Leaf) parent.children[slot - 1];
-      long prevVersion = prev.version();
-      if (!parent.tryUpgrade(pv)) {
-        return;
-      }
-      if (!prev.tryUpgrade(prevVersion)) {
-        parent.unlock();
-        return;
-      }
-      if (!node.tryUpgrade(v)) {
-        prev.unlock();
-        parent.unlock();
-        return;
-      }
-      Leaf leaf = (Leaf) node;
-      prev.high = leaf.high;
-      prev.next = leaf.next;
-      refit(prev);
-      removeChild(parent, slot);
-      prev.unlock();
-      parent.unlock();
-      // The leaf stays locked: it is no longer in the tree.
-    } catch (RuntimeException e) {
-      if (node.validate(v)) {
-        throw e;
       }
     }
   }
 
-  /** Removes child {@code slot} (at least 1) and the separator on its left from a locked node. */
-  private static void removeChild(Inner node, int slot) {
-    int n = node.count;
-    int tail = n - slot;
-    System.arraycopy(node.keys, slot, node.keys, slot - 1, tail);
-    System.arraycopy(node.children, slot + 1, node.children, slot, tail);
-    if (node.windows != null) {
-      System.arraycopy(node.windows, slot, node.windows, slot - 1, tail);
+  /** Does one pass of {@link #compact}. Gives {@code true} if it removed a node. */
+  private boolean compactOnce(K key) {
+    Node node = root;
+    long v = node.version();
+    if (Node.isLocked(v) || node != root) {
+      return false;
     }
-    node.keys[n - 1] = null;
-    node.children[n] = null;
-    node.count = n - 1;
+    Node toLower = null;
+    Inner parent = null;
+    long pv = 0;
+    int slot = 0;
+    long cv = 0;
+    try {
+      if (node instanceof Inner top && top.count == 0) {
+        toLower = top;
+      } else {
+        while (node instanceof Inner inner) {
+          int i = childIndex(inner, key);
+          Node child = inner.children[i];
+          cv = child.version();
+          if (Node.isLocked(cv) || !inner.validate(v)) {
+            return false;
+          }
+          if (child.count == 0 && inner.count > 0) {
+            parent = inner;
+            pv = v;
+            slot = i;
+            node = child;
+            break;
+          }
+          node = child;
+          v = cv;
+        }
+      }
+      if (toLower == null && parent == null) {
+        return false;
+      }
+    } catch (RuntimeException e) {
+      if (node.validate(v)) {
+        throw e;
+      }
+      return false;
+    }
+    if (toLower != null) {
+      return lowerRoot(toLower, v);
+    }
+    return removeEmpty(parent, pv, slot, node, cv);
+  }
+
+  /** Makes the only child of the root the new root. The old root stays locked. */
+  private boolean lowerRoot(Node top, long v) {
+    if (!top.tryUpgrade(v)) {
+      return false;
+    }
+    if (root != top || top.count != 0) {
+      top.unlock();
+      return false;
+    }
+    root = ((Inner) top).children[0];
+    return true;
+  }
+
+  /**
+   * Removes the empty child {@code slot} of {@code parent}, if no node changed since the versions
+   * that the caller read. The parent has at least one separator, so the child has a sibling.
+   */
+  private boolean removeEmpty(Inner parent, long pv, int slot, Node empty, long ev) {
+    if (!parent.tryUpgrade(pv)) {
+      return false;
+    }
+    try {
+      // The parent is locked, so its children do not change.
+      boolean fromLeft = slot > 0;
+      Node sibling = parent.children[fromLeft ? slot - 1 : slot + 1];
+      long sv = sibling.version();
+      // An empty inner node next to a full sibling takes a child from it, and both stay.
+      boolean steal = empty instanceof Inner && sibling.count >= sibling.capacity();
+      // Lock the two children from left to right. An empty leaf on the left takes the entries
+      // of its sibling, so that the leaf before it in the chain keeps a valid next link.
+      Node first = fromLeft ? sibling : empty;
+      Node second = fromLeft ? empty : sibling;
+      Node gone = steal ? null : empty instanceof Leaf && !fromLeft ? sibling : empty;
+      if (!first.tryUpgrade(fromLeft ? sv : ev)) {
+        return false;
+      }
+      if (!second.tryUpgrade(fromLeft ? ev : sv)) {
+        first.unlock();
+        return false;
+      }
+      boolean removed = false;
+      try {
+        if (steal) {
+          stealChild((Inner) empty, (Inner) sibling, parent, slot, fromLeft);
+        } else if (empty instanceof Leaf) {
+          mergeIntoLeft((Leaf) first, (Leaf) second, parent, fromLeft ? slot : slot + 1);
+        } else if (fromLeft) {
+          giveChildLeft((Inner) sibling, (Inner) empty, parent, slot);
+        } else {
+          giveChildRight((Inner) empty, (Inner) sibling, parent);
+        }
+        removed = true;
+        return true;
+      } finally {
+        // The node that left the tree stays locked.
+        if (!removed || first != gone) {
+          first.unlock();
+        }
+        if (!removed || second != gone) {
+          second.unlock();
+        }
+      }
+    } finally {
+      parent.unlock();
+    }
+  }
+
+  /**
+   * Moves the entries of a locked leaf into its locked left neighbor, which is empty or which
+   * receives an empty leaf, and removes child {@code slot} of the parent.
+   */
+  private void mergeIntoLeft(Leaf left, Leaf right, Inner parent, int slot) {
+    int n = left.count;
+    int m = right.count;
+    int prefix = prefixOf(left.low, right.high);
+    long[] windows = null;
+    if (inline != null) {
+      windows = new long[left.capacity()];
+      Object[] keys = new Object[n + m];
+      System.arraycopy(left.keys, 0, keys, 0, n);
+      System.arraycopy(right.keys, 0, keys, n, m);
+      long[] w = windowsOf(keys, n + m, prefix);
+      System.arraycopy(w, 0, windows, 0, n + m);
+    }
+    // Commit: nothing below throws.
+    System.arraycopy(right.keys, 0, left.keys, n, m);
+    System.arraycopy(right.values, 0, left.values, n, m);
+    left.count = n + m;
+    left.high = right.high;
+    left.next = right.next;
+    setPrefix(left, prefix, windows);
+    removeChild(parent, slot - 1, slot);
+  }
+
+  /**
+   * Moves the nearest child of a locked, full sibling into a locked, empty inner node, with the
+   * separator between them. The separator in the parent changes to the key that bounded the
+   * moved child in the sibling. The fences of the moved child do not change.
+   */
+  @SuppressWarnings("unchecked")
+  private void stealChild(Inner empty, Inner sibling, Inner parent, int slot, boolean fromLeft) {
+    int n = sibling.count;
+    int keyIndex = fromLeft ? slot - 1 : slot;
+    Object oldSeparator = parent.keys[keyIndex];
+    Object newSeparator = fromLeft ? sibling.keys[n - 1] : sibling.keys[0];
+    Object emptyLow = fromLeft ? newSeparator : empty.low;
+    Object emptyHigh = fromLeft ? empty.high : newSeparator;
+    Object siblingLow = fromLeft ? sibling.low : newSeparator;
+    Object siblingHigh = fromLeft ? newSeparator : sibling.high;
+    Object[] siblingKeys = new Object[sibling.capacity()];
+    if (fromLeft) {
+      System.arraycopy(sibling.keys, 0, siblingKeys, 0, n - 1);
+    } else {
+      System.arraycopy(sibling.keys, 1, siblingKeys, 0, n - 1);
+    }
+    int emptyPrefix = prefixOf(emptyLow, emptyHigh);
+    int siblingPrefix = prefixOf(siblingLow, siblingHigh);
+    long[] emptyWindows = windowsOf(new Object[] {oldSeparator}, 1, emptyPrefix);
+    long[] siblingWindows = windowsOf(siblingKeys, n - 1, siblingPrefix);
+    long separatorWindow = inline != null ? window((K) newSeparator, parent.prefix) : 0L;
+    // Commit: nothing below throws.
+    Node child = empty.children[0];
+    empty.keys[0] = oldSeparator;
+    if (fromLeft) {
+      empty.children[0] = sibling.children[n];
+      empty.children[1] = child;
+      sibling.children[n] = null;
+    } else {
+      empty.children[0] = child;
+      empty.children[1] = sibling.children[0];
+      System.arraycopy(sibling.children, 1, sibling.children, 0, n);
+      sibling.children[n] = null;
+    }
+    System.arraycopy(siblingKeys, 0, sibling.keys, 0, n);
+    empty.count = 1;
+    sibling.count = n - 1;
+    empty.low = emptyLow;
+    empty.high = emptyHigh;
+    sibling.low = siblingLow;
+    sibling.high = siblingHigh;
+    if (emptyWindows != null) {
+      empty.windows[0] = emptyWindows[0];
+    }
+    empty.prefix = emptyPrefix;
+    setPrefix(sibling, siblingPrefix, siblingWindows);
+    parent.keys[keyIndex] = newSeparator;
+    if (inline != null) {
+      parent.windows[keyIndex] = separatorWindow;
+    }
+  }
+
+  /** Gives the only child of a locked, empty inner node to its locked left neighbor. */
+  private void giveChildLeft(Inner left, Inner empty, Inner parent, int slot) {
+    Object separator = parent.keys[slot - 1];
+    int n = left.count;
+    Object[] keys = Arrays.copyOf(left.keys, left.capacity());
+    keys[n] = separator;
+    int prefix = prefixOf(left.low, empty.high);
+    long[] windows = windowsOf(keys, n + 1, prefix);
+    // Commit: nothing below throws.
+    left.keys[n] = separator;
+    left.children[n + 1] = empty.children[0];
+    left.count = n + 1;
+    left.high = empty.high;
+    setPrefix(left, prefix, windows);
+    removeChild(parent, slot - 1, slot);
+  }
+
+  /** Gives the only child of a locked, empty inner node (child 0) to its locked right neighbor. */
+  private void giveChildRight(Inner empty, Inner right, Inner parent) {
+    Object separator = parent.keys[0];
+    int n = right.count;
+    Object[] keys = new Object[right.capacity()];
+    keys[0] = separator;
+    System.arraycopy(right.keys, 0, keys, 1, n);
+    int prefix = prefixOf(empty.low, right.high);
+    long[] windows = windowsOf(keys, n + 1, prefix);
+    // Commit: nothing below throws.
+    System.arraycopy(right.keys, 0, right.keys, 1, n);
+    System.arraycopy(right.children, 0, right.children, 1, n + 1);
+    right.keys[0] = separator;
+    right.children[0] = empty.children[0];
+    right.count = n + 1;
+    right.low = empty.low;
+    setPrefix(right, prefix, windows);
+    removeChild(parent, 0, 0);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -856,6 +1224,67 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   }
 
   private EntrySet entrySet;
+  private KeySet keySet;
+
+  @Override
+  public Set<K> keySet() {
+    KeySet set = keySet;
+    if (set == null) {
+      set = new KeySet();
+      keySet = set;
+    }
+    return set;
+  }
+
+  /** The keys. Unlike the key set of AbstractMap, it finds and removes a key in O(log n). */
+  private final class KeySet extends AbstractSet<K> {
+
+    @Override
+    public Iterator<K> iterator() {
+      Iterator<Map.Entry<K, V>> entries = BBTreeMap.this.iterator(null, true, null, false);
+      return new Iterator<>() {
+        @Override
+        public boolean hasNext() {
+          return entries.hasNext();
+        }
+
+        @Override
+        public K next() {
+          return entries.next().getKey();
+        }
+
+        @Override
+        public void remove() {
+          entries.remove();
+        }
+      };
+    }
+
+    @Override
+    public int size() {
+      return BBTreeMap.this.size();
+    }
+
+    @Override
+    public boolean isEmpty() {
+      return BBTreeMap.this.isEmpty();
+    }
+
+    @Override
+    public boolean contains(Object o) {
+      return containsKey(o);
+    }
+
+    @Override
+    public boolean remove(Object o) {
+      return BBTreeMap.this.remove(o) != null;
+    }
+
+    @Override
+    public void clear() {
+      BBTreeMap.this.clear();
+    }
+  }
 
   @Override
   public Set<Map.Entry<K, V>> entrySet() {
@@ -906,7 +1335,11 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     }
   }
 
-  /** An entry whose {@code setValue} writes through to the map. */
+  /**
+   * An entry whose {@code setValue} writes through to the map with {@code put}. As in {@link
+   * java.util.concurrent.ConcurrentHashMap}, it puts the key back if another thread removed it,
+   * and it gives the value that the iterator saw.
+   */
   private final class WriteThroughEntry extends AbstractMap.SimpleEntry<K, V> {
 
     private static final long serialVersionUID = 1L;
@@ -1123,13 +1556,24 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
 
   /** Gives the number of leaves in the leaf chain. */
   int leafCount() {
+    return countLeaves(false);
+  }
+
+  /** Gives the number of empty leaves in the leaf chain. */
+  int emptyLeafCount() {
+    return countLeaves(true);
+  }
+
+  private int countLeaves(boolean emptyOnly) {
     Node node = root;
     while (node instanceof Inner inner) {
       node = inner.children[0];
     }
     int count = 0;
     for (Leaf leaf = (Leaf) node; leaf != null; leaf = leaf.next) {
-      count++;
+      if (!emptyOnly || leaf.count == 0) {
+        count++;
+      }
     }
     return count;
   }
@@ -1167,6 +1611,19 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     }
     for (int i = n; i < node.capacity(); i++) {
       check(node.keys[i] == null, "stale key at " + i);
+    }
+    if (node instanceof Inner inner) {
+      // A separator equal to the lower fence would give child 0 an empty range.
+      check(n == 0 || node.low == null || comparator.compare((K) node.low, (K) node.keys[0]) < 0,
+          "a separator equals the lower fence");
+      for (int i = n + 1; i < inner.children.length; i++) {
+        check(inner.children[i] == null, "stale child at " + i);
+      }
+    } else {
+      Leaf leaf = (Leaf) node;
+      for (int i = n; i < leaf.values.length; i++) {
+        check(leaf.values[i] == null, "stale value at " + i);
+      }
     }
     if (inline != null) {
       int prefix =

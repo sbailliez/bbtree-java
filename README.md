@@ -51,9 +51,10 @@ instructions, then the cache coherence traffic. Each item below decreases one of
    in its parent. Thus the node prefix is the common prefix of these two separators, and no node
    stores the prefix bytes. Keys with long shared prefixes, such as URLs, still get useful
    windows.
-3. **A search with no branch.** A node search counts the windows that are smaller than the window
-   of the target. The count is the index of the child. The loop has no data-dependent branch, so
-   the CPU does not mispredict.
+3. **A linear scan of the windows.** A node search scans the sorted windows and stops at the
+   first window that is not smaller than the target. The Rust bbtree counts the smaller windows
+   with SIMD and no branch. C2 does not vectorize that count on AArch64, and in JMH the scan
+   with an early exit was 11% to 22% faster for `get`.
 4. **Optimistic lock coupling.** Each node has a version. A reader reads the version, reads the
    node, and makes sure that the version did not change. A read writes no shared cache line. A
    writer locks one leaf, plus the parent when a node splits. A full inner node splits on the way
@@ -63,9 +64,13 @@ instructions, then the cache coherence traffic. Each item below decreases one of
    a reader holds it. For the same reason, readers read leaves optimistically too: a value is a
    reference that the garbage collector keeps valid.
 6. **Interleaved batch lookups.** `getMany` moves 16 lookups down the tree one level at a time.
-   The searches of different lookups do not depend on each other, so the CPU waits for their
-   cache misses in parallel.
-7. **Append splits.** When a key goes after the last key of the rightmost node, the split moves
+   Java has no prefetch instruction, and an acquire load stops later loads. Thus each level
+   first searches all lanes and loads each child with a plain load, which starts the cache misses
+   together. Then it reads the versions and validates the lanes.
+7. **Shifted windows on split.** For `Long`, `Integer`, and `UUID`, a window holds the whole
+   rest of the key. A split makes the prefix of each half longer, so the new windows are the old
+   windows shifted to the left, and the split reads no key object.
+8. **Append splits.** When a key goes after the last key of the rightmost node, the split moves
    only the last key. Ascending keys, such as UUID v7 or sequence numbers, fill the leaves to 31
    of 32 entries, not to half.
 
@@ -73,21 +78,35 @@ instructions, then the cache coherence traffic. Each item below decreases one of
 
 - No hand-written SIMD. The JIT compiles the count loop. The Java Vector API is still an
   incubator module in Java 25.
-- Removal unlinks a leaf that becomes empty, if the leaf has a left sibling in the same parent.
-  The map does not merge leaves that are not empty, and the tree height does not decrease.
+- Removal removes empty nodes only. An empty leaf merges with a sibling, an empty inner node gives
+  its child to a sibling (or takes one from a full sibling), and a root with one child gives its
+  place to the child. A map that becomes empty goes back to one leaf. The Rust bbtree also
+  merges nodes that are less than 1/8 full. This port does not, so a map with few keys that are
+  far apart can keep many sparse leaves.
 - There is no single-thread variant, no memory-mapped file format, and no write-ahead log.
 - `size()` comes from a `LongAdder`. It is exact when no write runs at the same time.
 
+### Possible next steps
+
+These changes were measured or estimated in a review, but they are not done:
+
+- **A node layout with fewer objects.** A lookup level reads the node object, then its `long[]`
+  of windows, then its `children` array: three dependent loads, where the Rust page has two.
+  Estimated gain: 20% to 30% of `get`. It needs a rewrite without the `Node` classes.
+- **A primitive `long` API.** Every lookup first reads its boxed `Long` key, which is a cache miss
+  of its own. A run with the key objects in sequence was 50 to 95 ns faster per lookup.
+- **Hash tags, a prefix for the whole tree, and 2-byte windows**, as in the Rust bbtree.
+
 ## Tests
 
-`mvn verify` runs approximately 3000 tests:
+`mvn verify` runs approximately 3,000 tests:
 
 | Test | What it does |
 |---|---|
 | `InlineKeyContractTest` | Compares each built-in `InlineKey` with a reference byte encoding: order, windows at each offset, common prefix. |
-| `DifferentialTest` | Runs 60,000 random operations for each of 10 configurations against a `TreeMap`, and checks the tree structure every 2,000 operations. |
-| `BBTreeMapTest` | Unit tests: ranges, iterators, `getMany`, leaf removal, ascending loads, errors. |
-| `ConcurrencyTest` | Readers, iterators, and batch lookups run while writers split and remove leaves. Steady keys must never disappear. Also atomic `merge` and single removal. |
+| `DifferentialTest` | Runs 60,000 random operations for each of 10 configurations against a `TreeMap`. Every 2,000 operations, it checks the tree structure and that no empty leaf remains. |
+| `BBTreeMapTest` | Unit tests: ranges, iterators, `getMany`, compaction, ascending loads, and exceptions from user code, which must leave no lock held. |
+| `ConcurrencyTest` | Readers, iterators, and batch lookups run while writers split nodes and empty whole subtrees. Steady keys must never disappear. Also atomic `merge` and single removal. |
 | `GuavaMapContractTest` | The `ConcurrentMap` contract suites of guava-testlib, for 3 configurations. |
 
 Small nodes (4 entries) in most tests make splits and leaf removals frequent.

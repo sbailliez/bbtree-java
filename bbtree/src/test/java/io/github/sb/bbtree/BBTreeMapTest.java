@@ -171,18 +171,106 @@ class BBTreeMapTest {
   }
 
   @Test
-  void removalUnlinksEmptyLeaves() {
+  void removalReclaimsEmptyNodes() {
+    for (boolean ascending : new boolean[] {true, false}) {
+      BBTreeMap<Long, Long> map = new BBTreeMap<>(InlineKey.LONG, 4, 4);
+      int n = 5_000;
+      LongStream.range(0, n).forEach(i -> map.put(i, i));
+      int leavesBefore = map.leafCount();
+      LongStream.range(0, n).filter(i -> i % 100 != 0).forEach(map::remove);
+      assertEquals(n / 100, map.checkInvariants());
+      assertEquals(0, map.emptyLeafCount());
+      assertTrue(map.leafCount() <= n / 100, "leaves before " + leavesBefore + ", after " + map.leafCount());
+      for (int i = 0; i < n; i += 100) {
+        map.remove(ascending ? (long) i : (long) (n - 100 - i));
+      }
+      assertEquals(0, map.checkInvariants());
+      assertEquals(1, map.height());
+      assertEquals(1, map.leafCount());
+      LongStream.range(0, n).forEach(i -> map.put(i, -i));
+      assertEquals(n, map.checkInvariants());
+    }
+  }
+
+  @Test
+  void randomRemovalOfEverythingLeavesOneLeaf() {
     BBTreeMap<Long, Long> map = new BBTreeMap<>(InlineKey.LONG, 4, 4);
-    int n = 5_000;
-    LongStream.range(0, n).forEach(i -> map.put(i, i));
-    int leavesBefore = leaves(map);
-    LongStream.range(0, n).filter(i -> i % 100 != 0).forEach(map::remove);
-    assertEquals(n / 100, map.checkInvariants());
-    int leavesAfter = leaves(map);
-    assertTrue(
-        leavesAfter < leavesBefore / 2, "leaves before " + leavesBefore + ", after " + leavesAfter);
-    LongStream.range(0, n).forEach(i -> map.put(i, -i));
-    assertEquals(n, map.checkInvariants());
+    java.util.Random r = new java.util.Random(3);
+    List<Long> keys = new ArrayList<>();
+    for (int i = 0; i < 20_000; i++) {
+      long k = r.nextLong();
+      keys.add(k);
+      map.put(k, k);
+    }
+    java.util.Collections.shuffle(keys, r);
+    keys.forEach(map::remove);
+    assertEquals(0, map.checkInvariants());
+    assertEquals(1, map.height());
+    assertEquals(1, map.leafCount());
+  }
+
+  @Test
+  void aComparatorExceptionDuringASplitLeavesNoLock() {
+    // The comparator throws only when key 99 comes first. Searches compare the stored key first,
+    // so only the append check of a split calls it in this order.
+    java.util.Comparator<Integer> comparator =
+        (a, b) -> {
+          if (a == 99 && b != 99) {
+            throw new IllegalStateException("boom");
+          }
+          return Integer.compare(a, b);
+        };
+    BBTreeMap<Integer, Integer> map = new BBTreeMap<>(comparator, null, 4, 4);
+    for (int i = 1; i <= 4; i++) {
+      map.put(i, i);
+    }
+    assertThrows(IllegalStateException.class, () -> map.put(99, 99));
+    assertEquals(4, map.checkInvariants());
+    org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+        java.time.Duration.ofSeconds(5),
+        () -> {
+          assertEquals(1, map.get(1));
+          map.put(5, 5);
+        });
+    assertEquals(5, map.checkInvariants());
+  }
+
+  @Test
+  void contractEdges() {
+    BBTreeMap<Long, Long> map = new BBTreeMap<>(InlineKey.LONG);
+    assertThrows(NullPointerException.class, () -> map.remove(null, null));
+    BBTreeMap<Object, Integer> natural = new BBTreeMap<>();
+    assertThrows(ClassCastException.class, () -> natural.put(new Object(), 1));
+    assertTrue(natural.isEmpty());
+    BBTreeMap<byte[], Integer> bytes = new BBTreeMap<>(InlineKey.BYTES);
+    bytes.put(new byte[] {1, 2}, 1);
+    assertTrue(bytes.keySet().contains(new byte[] {1, 2}));
+    assertTrue(bytes.keySet().remove(new byte[] {1, 2}));
+    assertTrue(bytes.isEmpty());
+  }
+
+  @Test
+  void getManyThrowsAsGetDoes() {
+    for (int size : new int[] {1, 1_000}) {
+      BBTreeMap<Object, Object> map = new BBTreeMap<>(null, null, 4, 4);
+      for (long k = 0; k < size; k++) {
+        map.put(k, k);
+      }
+      assertThrows(ClassCastException.class, () -> map.get("x"));
+      assertThrows(
+          ClassCastException.class, () -> map.getMany(new Object[] {0L, "x"}, new Object[2]));
+    }
+  }
+
+  @Test
+  void updatesOfAbsentKeysDoNotChangeTheMap() {
+    BBTreeMap<Long, Long> map = new BBTreeMap<>(InlineKey.LONG, 4, 4);
+    LongStream.range(0, 100).forEach(i -> map.put(i * 2, i));
+    assertNull(map.remove(1L));
+    assertNull(map.replace(1L, 5L));
+    assertFalse(map.replace(1L, 5L, 6L));
+    assertFalse(map.remove(1L, 5L));
+    assertEquals(100, map.checkInvariants());
   }
 
   @Test
@@ -211,9 +299,5 @@ class BBTreeMapTest {
     List<Long> out = new ArrayList<>();
     it.forEachRemaining(e -> out.add(e.getKey()));
     return out;
-  }
-
-  private static int leaves(BBTreeMap<?, ?> map) {
-    return map.leafCount();
   }
 }

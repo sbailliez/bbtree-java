@@ -139,6 +139,8 @@ class DifferentialTest {
     map.clear();
     expected.clear();
     checkAll(map, expected, where + " after clear");
+    assertEquals(1, map.height(), where + ": height after clear");
+    assertEquals(1, map.leafCount(), where + ": leaves after clear");
   }
 
   private static <K> void checkRange(
@@ -165,6 +167,8 @@ class DifferentialTest {
   private static <K> void checkAll(
       BBTreeMap<K, Integer> map, TreeMap<K, Integer> expected, String at) {
     assertEquals(expected.size(), map.checkInvariants(), at);
+    // On one thread, compaction always succeeds: the only empty leaf is the root of an empty map.
+    assertEquals(expected.isEmpty() ? 1 : 0, map.emptyLeafCount(), at + ": empty leaves");
     assertEquals(expected.size(), map.size(), at);
     assertEquals(expected.isEmpty(), map.isEmpty(), at);
     assertEntries(expected, map.entrySet().iterator(), at);

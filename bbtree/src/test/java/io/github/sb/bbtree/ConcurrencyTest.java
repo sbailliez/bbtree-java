@@ -211,6 +211,75 @@ class ConcurrencyTest {
     map.checkInvariants();
   }
 
+  @ParameterizedTest(name = "{0}")
+  @MethodSource("longMaps")
+  void compactionKeepsSteadyKeys(String name, Supplier<BBTreeMap<Long, Long>> factory)
+      throws Exception {
+    BBTreeMap<Long, Long> map = factory.get();
+    int blocks = 64;
+    int block = 500;
+    // The first key of each block stays. The writers fill a block and empty it again, so that
+    // whole subtrees empty out and the compaction removes leaves and inner nodes.
+    for (long b = 0; b < blocks; b++) {
+      map.put(b * block, b * block);
+    }
+    AtomicBoolean stop = new AtomicBoolean();
+    List<Callable<Void>> tasks = new ArrayList<>();
+    int writers = Math.max(2, THREADS / 2);
+    for (int t = 0; t < writers; t++) {
+      tasks.add(
+          () -> {
+            ThreadLocalRandom r = ThreadLocalRandom.current();
+            while (!stop.get()) {
+              long base = (long) r.nextInt(blocks) * block;
+              for (long k = base + 1; k < base + block; k++) {
+                map.put(k, k);
+              }
+              for (long k = base + 1; k < base + block; k++) {
+                map.remove(k);
+              }
+            }
+            return null;
+          });
+    }
+    for (int t = writers; t < THREADS; t++) {
+      boolean iterate = t % 2 == 0;
+      tasks.add(
+          () -> {
+            ThreadLocalRandom r = ThreadLocalRandom.current();
+            while (!stop.get()) {
+              if (iterate) {
+                long expected = 0;
+                long previous = Long.MIN_VALUE;
+                for (Map.Entry<Long, Long> e : map.entrySet()) {
+                  long k = e.getKey();
+                  assertTrue(k > previous, "keys out of order");
+                  assertEquals(k, e.getValue());
+                  if (k % block == 0) {
+                    assertEquals(expected, k, "the iterator skipped a steady key");
+                    expected += block;
+                  }
+                  previous = k;
+                }
+                assertEquals((long) blocks * block, expected, "the iterator stopped early");
+              } else {
+                long k = (long) r.nextInt(blocks) * block;
+                assertEquals(k, map.get(k), "a steady key is missing");
+              }
+            }
+            return null;
+          });
+    }
+    runFor(tasks, stop);
+    assertEquals(map.size(), map.checkInvariants());
+    for (long k : new ArrayList<>(map.keySet())) {
+      if (k % block != 0) {
+        map.remove(k);
+      }
+    }
+    assertEquals(blocks, map.checkInvariants());
+  }
+
   @Test
   void mergeIsAtomic() throws Exception {
     BBTreeMap<Long, Long> map = new BBTreeMap<>(InlineKey.LONG, 4, 4);
