@@ -318,44 +318,32 @@ slower than the scalar scan in every mode, on AMD Zen 5 and on Intel Sapphire Ra
 NEON assembly on arm64. Its `bench/main.go` and `bench/reference.rs` run the same workloads on Go
 and on Rust. `CrossLanguage` runs them on this port, with the same flags, keys, values and
 checksums. The checksums of the three agree on every operation. `cross-language.sh` builds the Go
-and Rust programs at pinned revisions and interleaves the three languages:
+and Rust programs at pinned revisions and interleaves the three languages. It has four commands:
 
 ```sh
 mvn -B package -DskipTests
-bbtree-benchmarks/cross-language.sh 6 > results.csv
+# Needs internet: clones bbtree-go and the Rust bbtree, and stores the Rust crates locally.
+bbtree-benchmarks/cross-language.sh prepare ~/.cache/bbtree-cross
+# Works offline: builds Go and Rust, then runs 6 rounds on this machine.
+bbtree-benchmarks/cross-language.sh run ~/.cache/bbtree-cross 6 > results.csv
+# Copies the directory to a host, installs Java 25, Go and Rust with dnf if they are missing,
+# and runs there. The host needs no internet, only the Amazon Linux package repository.
+SSH_OPTS="-J bastion" bbtree-benchmarks/cross-language.sh remote ec2-user@10.0.0.5 \
+    ~/.cache/bbtree-cross 6 > c7g.csv
+# Prints the median of each case.
+bbtree-benchmarks/cross-language.sh table results.csv
 ```
 
-Apple M5 Pro, Go 1.27.3, Rust 1.99.1 with `-C target-cpu=native`, Corretto 25.0.4 with an 8 GB
-heap. 1,048,576 entries, median of 6 rounds, ns per operation. Java runs the workload 5 times in
-one JVM and keeps the last time. "Java" is the scalar map (`LongBBTreeMap` for `uint64`), and
-"Java, vector" is the map of `bbtree-vector`.
+[docs/cross-language.md](docs/cross-language.md) gives the results on four machines: the Apple M5
+Pro, Graviton3, AMD Zen 5 and Intel Sapphire Rapids. The time of the faster Java map divided by
+the time of Rust:
 
-| Keys | Map | Operation | Threads | Rust | Go | Java | Java, vector | Best Java / Rust |
-|---|---|---|--:|--:|--:|--:|--:|--:|
-| `uint64` | single | insert | 1 | 76.4 | 91.0 | 118.9 | 143.5 | 1.56× |
-| `uint64` | single | hit | 1 | 36.7 | 42.8 | 156.0 | 154.7 | 4.21× |
-| `uint64` | single | miss | 1 | 32.1 | 33.8 | 96.9 | 99.9 | 3.02× |
-| `uint64` | single | batch hit | 1 | 22.4 | 22.7 | 102.7 | 87.1 | 3.89× |
-| `uint64` | single | delete | 1 | 84.9 | 90.5 | 150.4 | 176.7 | 1.77× |
-| `uint64` | single | scan of 64 | 1 | 204.4 | 198.6 | 1169.5 | 1246.2 | 5.72× |
-| `uint64` | concurrent | insert | 1 | 75.3 | 105.3 | 119.3 | 143.4 | 1.58× |
-| `uint64` | concurrent | hit | 1 | 37.6 | 58.0 | 158.6 | 152.2 | 4.05× |
-| `uint64` | concurrent | batch hit | 1 | 27.0 | 30.1 | 104.4 | 88.4 | 3.27× |
-| `uint64` | concurrent | insert | 8 | 29.0 | 50.0 | 29.6 | 33.0 | 1.02× |
-| `uint64` | concurrent | hit | 8 | 7.9 | 12.2 | 24.7 | 24.2 | 3.08× |
-| `uint64` | concurrent | 90% hits, 10% overwrites | 8 | 8.8 | 12.6 | 25.8 | 26.5 | 2.92× |
-| `string` | single | insert | 1 | 136.4 | 177.3 | 177.0 | 199.1 | 1.30× |
-| `string` | single | hit | 1 | 158.8 | 250.4 | 328.9 | 332.6 | 2.07× |
-| `string` | single | miss | 1 | 71.0 | 97.6 | 136.9 | 147.8 | 1.93× |
-| `string` | single | batch hit | 1 | 56.0 | 58.8 | 192.7 | 193.7 | 3.44× |
-| `string` | single | delete | 1 | 188.3 | 173.4 | 213.2 | 226.3 | 1.13× |
-| `string` | single | scan of 64 | 1 | 585.5 | 398.6 | 1150.9 | 1191.1 | 1.97× |
-| `string` | concurrent | insert | 1 | 140.3 | 243.8 | 176.6 | 194.4 | 1.26× |
-| `string` | concurrent | hit | 1 | 136.7 | 249.4 | 321.4 | 319.1 | 2.33× |
-| `string` | concurrent | batch hit | 1 | 63.5 | 78.6 | 191.5 | 193.4 | 3.01× |
-| `string` | concurrent | insert | 8 | 43.5 | 104.3 | 37.0 | 40.0 | 0.85× |
-| `string` | concurrent | hit | 8 | 24.1 | 35.9 | 47.6 | 47.9 | 1.97× |
-| `string` | concurrent | 90% hits, 10% overwrites | 8 | 31.1 | 36.6 | 48.1 | 49.0 | 1.55× |
+| Machine | Inserts and deletes | Lookups and scans |
+|---|--:|--:|
+| Apple M5 Pro | 0.90 to 2.04 | 1.70 to 5.71 |
+| Graviton3 (c7g.4xlarge) | 0.72 to 1.73 | 0.84 to 3.65 |
+| AMD Zen 5 (c8a.4xlarge) | 0.77 to 2.53 | 0.67 to 5.98 |
+| Intel Sapphire Rapids (c7i.4xlarge) | 0.91 to 3.04 | 0.87 to 6.82 |
 
 Differences in the workload:
 
@@ -365,10 +353,10 @@ Differences in the workload:
   in the leaf.
 - The Java scan uses the entry iterator, which makes one entry object for each entry.
 
-Java is close to Rust for inserts and deletes: 0.85 to 1.8 times the Rust time. With 8 threads,
-Java inserts are faster than Go, and `string` inserts are also faster than Rust. Lookups and
-scans take 1.6 to 5.7 times the Rust time. A large part of the gap comes from cache misses.
-At 65,536 entries, which stay in the cache, a `uint64` hit took 50 ns in Java and 21 ns in Rust.
+With 8 threads, Java inserts are at most 9% slower than Rust on all four machines, and 1.5 to 5.6
+times faster than Go. Lookups of `uint64` keys take 1.6 to 6.8 times the Rust time. On the M5, a
+large part of the gap comes from cache misses. At 65,536 entries, which stay in the cache, a
+`uint64` hit took 50 ns in Java and 21 ns in Rust.
 At 1M entries, it took 168 ns and 39 ns. The larger map thus added 118 ns in Java and 18 ns in
 Rust. A Java lookup reads more separate objects on each level: the node, its windows array and
 its children array, and at the end the value object. The node layout with fewer objects in
