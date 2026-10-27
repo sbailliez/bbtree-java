@@ -10,7 +10,8 @@ by Xiangpeng Hao. The design is explained in the post
 
 ## Usage
 
-Java 21 or later is necessary. The library has no runtime dependency.
+Java 21 or later is necessary for the core module `bbtree`. It has no runtime dependency. The
+optional module `bbtree-vector` needs Java 25.
 
 ```java
 import io.github.sb.bbtree.BBTreeMap;
@@ -76,8 +77,8 @@ instructions, then the cache coherence traffic. Each item below decreases one of
 
 ## Differences from the Rust bbtree
 
-- No hand-written SIMD. The JIT compiles the count loop. The Java Vector API is still an
-  incubator module in Java 25.
+- No SIMD in the core. The module `bbtree-vector` has a Vector API search, but it is not faster
+  on the machine of the measurements (see below).
 - Removal removes empty nodes only. An empty leaf merges with a sibling, an empty inner node gives
   its child to a sibling (or takes one from a full sibling), and a root with one child gives its
   place to the child. A map that becomes empty goes back to one leaf. The Rust bbtree also
@@ -127,56 +128,115 @@ java -jar bbtree-benchmarks/target/benchmarks.jar ConcurrentBenchmark -t 16
 | `PutBenchmark` | The build of a map of 1M keys, as time per insert. |
 | `ScanBenchmark` | 100 entries after a random key. |
 | `ConcurrentBenchmark` | Throughput of shared lookups, and of 90% lookups with 10% puts. |
+| `NodeSearchBenchmark` | One node search with the windows in the L1 cache: the scalar scan and the two vector scans. |
 
-The key types are `long`, `uuid4` (random UUID), `uuid7` (time-ordered UUID, in time order), and
+The `impl` values are `bbtree`, `bbtree-vector-scan`, `bbtree-vector-count`, `bbtree-noinline`,
+`treemap`, `skiplist`, and `rwlock-treemap`. The key types are `long`, `uuid4` (random UUID), `uuid7` (time-ordered UUID, in time order), and
 `string` (URL-like, with a 29-character shared prefix). The `impl` parameter also accepts
 `bbtree-<leaf>x<inner>`, for example `bbtree-64x64`, to compare node capacities.
 
 ### Results
 
 Apple M5 Pro (18 cores), Corretto 25.0.4, 8 GB heap, 1M keys, 1 JMH fork. The machine also ran
-a browser and other JVMs, so the error of each cell is between 10% and 100%. Run the benchmarks
-on a quiet machine before you depend on a number.
+a browser and other JVMs, at a load average between 4 and 20. Thus the error of a cell is often
+10% to 50%. Run the benchmarks on a quiet machine before you depend on a number.
 
-Lookups on one thread, half of them misses, in ns per lookup (less is better):
+Lookups on one thread, half of them misses, in ns per lookup (less is better). For bbtree, the
+number in parentheses is `getMany` with 64 keys a call, per key. For the other maps, a batch is
+64 calls to `get`, which gives the same speed as single lookups.
 
 | Keys | bbtree | bbtree, no inline keys | TreeMap | ConcurrentSkipListMap |
 |---|--:|--:|--:|--:|
-| `long` | 365 | 456 | 1,239 | 1,996 |
-| `uuid4` | 346 | 474 | 1,553 | 2,051 |
-| `uuid7` | 292 | 285 | 733 | 629 |
-| `string` | 475 | 1,021 | 1,248 | 3,293 |
+| `long` | 215 (91) | 360 (231) | 712 | 1,297 |
+| `uuid4` | 212 (112) | 342 (243) | 694 | 1,215 |
+| `uuid7` | 171 (91) | 190 (162) | 351 | 341 |
+| `string` | 266 (163) | 601 (632) | 939 | 1,640 |
 
 The build of a map of 1M keys on one thread, in ns per insert:
 
 | Keys | bbtree | bbtree, no inline keys | TreeMap | ConcurrentSkipListMap |
 |---|--:|--:|--:|--:|
-| `long` | 174 | 268 | 518 | 1,515 |
-| `uuid4` | 189 | 358 | 708 | 1,598 |
-| `uuid7` | 57 | 46 | 63 | 117 |
-| `string` | 304 | 523 | 1,006 | 2,333 |
+| `long` | 124 | 278 | 428 | 883 |
+| `uuid4` | 129 | 433 | 549 | 1,104 |
+| `uuid7` | 50 | 39 | 61 | 96 |
+| `string` | 197 | 539 | 935 | 1,456 |
 
 A scan of 100 entries on one thread, in ns per scan:
 
 | Keys | bbtree | TreeMap | ConcurrentSkipListMap |
 |---|--:|--:|--:|
-| `long` | 1,004 | 6,648 | 7,346 |
-| `uuid4` | 810 | 8,734 | 6,426 |
-| `string` | 797 | 10,520 | 8,285 |
+| `long` | 698 | 6,542 | 5,957 |
+| `uuid4` | 681 | 6,514 | 6,102 |
+| `string` | 715 | 6,760 | 6,443 |
 
 16 threads that share one map, in million operations per second (more is better):
 
 | Keys | Workload | bbtree | ConcurrentSkipListMap | TreeMap with a read-write lock |
 |---|---|--:|--:|--:|
-| `long` | lookups | 36.5 | 8.9 | 4.4 |
-| `long` | 90% lookups, 10% puts | 33.6 | 10.7 | 0.8 |
-| `uuid4` | lookups | 33.9 | 10.4 | 5.1 |
-| `uuid4` | 90% lookups, 10% puts | 32.9 | 8.2 | 1.3 |
-| `string` | lookups | 26.7 | 6.4 | 4.9 |
-| `string` | 90% lookups, 10% puts | 22.9 | 6.3 | 0.8 |
+| `long` | lookups | 44.3 | 7.0 | 4.2 |
+| `long` | 90% lookups, 10% puts | 43.5 | 7.7 | 0.9 |
+| `uuid4` | lookups | 40.2 | 6.5 | 4.3 |
+| `uuid4` | 90% lookups, 10% puts | 40.0 | 8.3 | 0.8 |
+| `string` | lookups | 31.2 | 6.1 | 4.7 |
+| `string` | 90% lookups, 10% puts | 31.2 | 5.2 | 1.1 |
 
-On one thread, the same workload gives bbtree 2.3 to 3.0, the skip list 0.5 to 0.6, and the
-locked TreeMap 0.9 to 1.3 million operations per second.
+On one thread, the same workloads give bbtree 2.7 to 3.7, the skip list 0.4 to 0.7, and the
+locked TreeMap 0.8 to 1.1 million operations per second.
 
-`getMany` gave between 0.9 and 2.3 times the speed of `get` in different runs on this machine.
-The noise is too high to give one number.
+## The Vector API variant
+
+The module `bbtree-vector` gives node scans that use the Java Vector API
+(`jdk.incubator.vector`). It needs Java 25 and `--add-modules jdk.incubator.vector`.
+
+```java
+BBTreeMap<Long, String> map =
+    VectorBBTreeMaps.create(InlineKey.LONG, VectorBBTreeMaps.Mode.SCAN);
+```
+
+It has two modes:
+
+- `COUNT` compares every window and counts, with no branch on the data, as the Rust bbtree does.
+- `SCAN` compares one register of windows at a time, and stops at the first window that is not
+  smaller than the target.
+
+**Result: on this machine, the Vector API does not make bbtree faster. Use the scalar map.**
+
+One node search with the windows in the L1 cache (`NodeSearchBenchmark`), in ns:
+
+| Windows in the node | Scalar scan | Vector `SCAN` | Vector `COUNT` |
+|--:|--:|--:|--:|
+| 16 | 2.5 | 2.9 | 4.1 |
+| 32 | 3.3 | 3.5 | 7.0 |
+| 64 | 5.6 | 4.9 | 12.9 |
+
+The full map, 1M keys, in ns per operation:
+
+| Keys | Operation | Scalar | Vector `SCAN` | Vector `COUNT` |
+|---|---|--:|--:|--:|
+| `long` | `get` | 215 | 204 | 187 |
+| `uuid4` | `get` | 212 | 200 | 202 |
+| `string` | `get` | 266 | 255 | 245 |
+| `long` | `getMany`, per key | 91 | 103 | 99 |
+| `string` | `getMany`, per key | 163 | 165 | 169 |
+| `long` | insert | 124 | 145 | 143 |
+| `uuid4` | insert | 129 | 151 | 159 |
+| `string` | insert | 197 | 235 | 260 |
+
+The `get` differences are smaller than the error of the cells, which was ±16 to ±68 ns. The
+inserts were 15% to 30% slower in every row.
+
+Why:
+
+- On Apple silicon, the preferred vector has 128 bits (NEON), so a `LongVector` holds only 2
+  windows. The Rust bbtree gets its gain from narrow windows: with 2-byte windows, one AVX-512
+  compare covers 32 keys.
+- A node search costs 3 to 6 ns when the node is in the cache. A lookup in a map of 1M keys
+  costs approximately 200 ns, and the cache misses take most of it. A faster compare changes
+  little.
+- A vector path needs windows of 2 or 4 bytes to help. In Java, a tie of a narrow window reads
+  the key object from the heap, which is the cost that the windows avoid. This port keeps
+  8-byte windows for that reason.
+
+On a CPU with 512-bit vectors (AVX-512, 8 `long` lanes), the result can be different. Run
+`NodeSearchBenchmark` and `GetBenchmark` with `-p impl=bbtree,bbtree-vector-scan,bbtree-vector-count`
+on that machine before you choose.

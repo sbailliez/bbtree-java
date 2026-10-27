@@ -14,6 +14,7 @@
 
   <modules>
     <module>bbtree</module>
+    <module>bbtree-vector</module>
     <module>bbtree-benchmarks</module>
   </modules>
 

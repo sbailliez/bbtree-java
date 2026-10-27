@@ -28,13 +28,13 @@ import org.openjdk.jmh.infra.Blackhole;
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 @Warmup(iterations = 3, time = 2)
 @Measurement(iterations = 5, time = 2)
-@Fork(value = 1, jvmArgsAppend = {"-Xms8g", "-Xmx8g", "-XX:+AlwaysPreTouch"})
+@Fork(value = 1, jvmArgsAppend = {"-Xms8g", "-Xmx8g", "-XX:+AlwaysPreTouch", "--add-modules=jdk.incubator.vector"})
 public class GetBenchmark {
 
   private static final int BATCH = 64;
   private static final int LOOKUPS = 1 << 20;
 
-  @Param({"bbtree", "bbtree-noinline", "treemap", "skiplist"})
+  @Param({"bbtree", "bbtree-vector-scan", "bbtree-vector-count", "bbtree-noinline", "treemap", "skiplist"})
   public String impl;
 
   @Param({"long", "uuid4", "uuid7", "string"})

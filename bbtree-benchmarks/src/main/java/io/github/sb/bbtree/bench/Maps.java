@@ -2,6 +2,7 @@ package io.github.sb.bbtree.bench;
 
 import io.github.sb.bbtree.BBTreeMap;
 import io.github.sb.bbtree.InlineKey;
+import io.github.sb.bbtree.VectorBBTreeMaps;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -16,6 +17,10 @@ final class Maps {
     return switch (impl) {
       case "bbtree" -> (Map) new BBTreeMap<>(inlineKey(keyType));
       case "bbtree-noinline" -> new BBTreeMap<>();
+      case "bbtree-vector-count" ->
+          (Map) VectorBBTreeMaps.create(inlineKey(keyType), VectorBBTreeMaps.Mode.COUNT);
+      case "bbtree-vector-scan" ->
+          (Map) VectorBBTreeMaps.create(inlineKey(keyType), VectorBBTreeMaps.Mode.SCAN);
       case "treemap" -> new TreeMap<>();
       case "skiplist" -> new ConcurrentSkipListMap<>();
       case "rwlock-treemap" -> new ReadWriteLockedMap<>(new TreeMap<>());

@@ -25,12 +25,12 @@ import org.openjdk.jmh.annotations.Warmup;
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 @Warmup(iterations = 3)
 @Measurement(iterations = 5)
-@Fork(value = 1, jvmArgsAppend = {"-Xms8g", "-Xmx8g", "-XX:+AlwaysPreTouch"})
+@Fork(value = 1, jvmArgsAppend = {"-Xms8g", "-Xmx8g", "-XX:+AlwaysPreTouch", "--add-modules=jdk.incubator.vector"})
 public class PutBenchmark {
 
   public static final int SIZE = 1_000_000;
 
-  @Param({"bbtree", "bbtree-noinline", "treemap", "skiplist"})
+  @Param({"bbtree", "bbtree-vector-scan", "bbtree-vector-count", "bbtree-noinline", "treemap", "skiplist"})
   public String impl;
 
   @Param({"long", "uuid4", "uuid7", "string"})

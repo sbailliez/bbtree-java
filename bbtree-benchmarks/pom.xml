@@ -13,10 +13,20 @@
   <artifactId>bbtree-benchmarks</artifactId>
   <name>bbtree-benchmarks</name>
 
+  <properties>
+    <!-- The benchmarks use bbtree-vector, which needs Java 25. -->
+    <maven.compiler.release>25</maven.compiler.release>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>io.github.sb</groupId>
       <artifactId>bbtree</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.sb</groupId>
+      <artifactId>bbtree-vector</artifactId>
       <version>${project.version}</version>
     </dependency>
     <dependency>
@@ -37,7 +47,9 @@
         <artifactId>maven-compiler-plugin</artifactId>
         <configuration>
           <!-- The JMH annotation processor emits warnings that -Werror would turn into errors. -->
-          <compilerArgs combine.self="override"/>
+          <compilerArgs combine.self="override">
+            <arg>--add-modules=jdk.incubator.vector</arg>
+          </compilerArgs>
           <annotationProcessorPaths>
             <path>
               <groupId>org.openjdk.jmh</groupId>

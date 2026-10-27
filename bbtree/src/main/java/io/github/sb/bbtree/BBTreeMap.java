@@ -64,6 +64,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
 
   private final Comparator<? super K> comparator;
   private final InlineKey<K> inline;
+  private final WindowScan scan;
 
   /** A node with a prefix of this length or more compares no key on a window tie. */
   private final int exactFrom;
@@ -113,6 +114,16 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   @SuppressWarnings("unchecked")
   BBTreeMap(
       Comparator<? super K> comparator, InlineKey<K> inline, int leafCapacity, int innerCapacity) {
+    this(comparator, inline, leafCapacity, innerCapacity, WindowScan.SCALAR);
+  }
+
+  @SuppressWarnings("unchecked")
+  BBTreeMap(
+      Comparator<? super K> comparator,
+      InlineKey<K> inline,
+      int leafCapacity,
+      int innerCapacity,
+      WindowScan scan) {
     if (leafCapacity < MIN_CAPACITY || leafCapacity > MAX_CAPACITY) {
       throw new IllegalArgumentException("leafCapacity out of range: " + leafCapacity);
     }
@@ -122,6 +133,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     this.comparator =
         comparator != null ? comparator : (Comparator<? super K>) Comparator.naturalOrder();
     this.inline = inline;
+    this.scan = Objects.requireNonNull(scan);
     int fixed = inline == null ? -1 : inline.fixedLength();
     this.exactFrom = fixed < 0 ? Integer.MAX_VALUE : fixed - Long.BYTES;
     this.leafCapacity = leafCapacity;
@@ -152,13 +164,8 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   }
 
   /**
-   * Finds {@code key} in a leaf.
-   *
-   * <p>The scan over the windows stops at the first window that is not smaller than the target.
-   * A count of all windows with no branch does more work: C2 does not vectorize it on AArch64,
-   * and the early exit was 11 to 22% faster for {@code get} in JMH. The windows are sorted, so
-   * the scan finds the same index. The comparator runs in a separate method, so that this method
-   * stays small enough for the JIT to inline the {@link InlineKey} call.
+   * Finds {@code key} in a leaf. The comparator runs in a separate method, so that this method
+   * stays small enough for the JIT to inline the {@link InlineKey} call and the scan.
    *
    * @return the index of the key, or {@code -(insertion point) - 1} if the leaf does not have it
    */
@@ -167,16 +174,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     if (w == null) {
       return findKey(node.keys, 0, Math.min(node.count, node.keys.length), key);
     }
-    int n = Math.min(node.count, w.length);
-    long t = window(key, node.prefix);
-    int lo = 0;
-    while (lo < n && w[lo] < t) {
-      lo++;
-    }
-    int hi = lo;
-    while (hi < n && w[hi] == t) {
-      hi++;
-    }
+    long position = scan.scan(w, Math.min(node.count, w.length), window(key, node.prefix));
+    int lo = (int) (position >>> 32);
+    int hi = (int) position;
     if (lo == hi) {
       return -lo - 1;
     }
@@ -209,16 +209,9 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     if (w == null) {
       return upperBound(node.keys, 0, Math.min(node.count, node.keys.length), key);
     }
-    int n = Math.min(node.count, w.length);
-    long t = window(key, node.prefix);
-    int lo = 0;
-    while (lo < n && w[lo] < t) {
-      lo++;
-    }
-    int hi = lo;
-    while (hi < n && w[hi] == t) {
-      hi++;
-    }
+    long position = scan.scan(w, Math.min(node.count, w.length), window(key, node.prefix));
+    int lo = (int) (position >>> 32);
+    int hi = (int) position;
     if (lo == hi || node.prefix >= exactFrom) {
       return hi;
     }
