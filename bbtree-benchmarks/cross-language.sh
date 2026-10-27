@@ -96,7 +96,9 @@ run() {
         args=(-kind "$kind" -mode "$mode" -threads "$threads" -op "$op")
         "$dir/go-bench" "${args[@]}" | sed "s/^/$round,/"
         "$dir/reference/target/release/bbtree-reference" "${args[@]}" | sed "s/^/$round,/"
-        for impl in scalar vector; do
+        impls=(scalar vector)
+        [[ "$kind" == uint64 ]] && impls+=(packed)
+        for impl in "${impls[@]}"; do
           # The last of 5 repetitions in one JVM, after the JIT warm-up.
           # shellcheck disable=SC2086
           java -Xms8g -Xmx8g ${JAVA_OPTS:-} --add-modules=jdk.incubator.vector -cp "$dir/benchmarks.jar" \
@@ -142,12 +144,12 @@ cases = {}
 for r in rows:
     key = (r["kind"], r["mode"], r["operation"], r["threads"])
     cases.setdefault(key, {}).setdefault(r["language"], []).append(float(r["ns/op"]))
-langs = ["rust", "go", "java", "java-vector"]
-print("| Keys | Map | Operation | Threads | Rust | Go | Java | Java, vector | Best Java / Rust |")
-print("|---|---|---|--:|--:|--:|--:|--:|--:|")
+langs = ["rust", "go", "java", "java-vector", "java-packed"]
+print("| Keys | Map | Operation | Threads | Rust | Go | Java | Java, vector | Java, packed | Best Java / Rust |")
+print("|---|---|---|--:|--:|--:|--:|--:|--:|--:|")
 for (kind, mode, op, threads), v in cases.items():
     m = {l: statistics.median(v[l]) for l in langs if l in v}
-    best = min(m.get("java", float("inf")), m.get("java-vector", float("inf")))
+    best = min(m.get(l, float("inf")) for l in ("java", "java-vector", "java-packed"))
     cells = " | ".join(f"{m[l]:.1f}" if l in m else "-" for l in langs)
     print(f"| `{kind}` | {mode} | {op} | {threads} | {cells} | {best / m['rust']:.2f}× |")
 EOF

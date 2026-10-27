@@ -3,6 +3,7 @@ package io.github.sb.bbtree.bench;
 import io.github.sb.bbtree.BBTreeMap;
 import io.github.sb.bbtree.InlineKey;
 import io.github.sb.bbtree.LongLongBBTreeMap;
+import io.github.sb.bbtree.PackedLongMap;
 import io.github.sb.bbtree.VectorBBTreeMaps;
 import java.util.Arrays;
 import java.util.concurrent.CyclicBarrier;
@@ -28,7 +29,8 @@ import java.util.function.BiPredicate;
  * that stops after 64 entries, and make no entry object. A JVM needs warm-up, so the program repeats the whole
  * workload {@code -repeat} times with a new map each time, and prints one row for each
  * repetition. Compare the last rows with Go and Rust. The flag {@code -impl} chooses the map:
- * {@code vector} (the default) for the vector count of bbtree-vector, or {@code scalar}.
+ * {@code vector} (the default) for the vector count of bbtree-vector, {@code scalar}, or {@code
+ * packed} for {@link PackedLongMap} ({@code uint64} keys only).
  */
 public final class CrossLanguage {
 
@@ -48,7 +50,12 @@ public final class CrossLanguage {
       String mode,
       String op,
       int repeat,
-      boolean vector) {}
+      String impl) {
+
+    boolean vector() {
+      return impl.equals("vector");
+    }
+  }
 
   public static void main(String[] args) throws Exception {
     Options o =
@@ -60,7 +67,7 @@ public final class CrossLanguage {
             flag(args, "-mode", "single"),
             flag(args, "-op", "hit"),
             Integer.parseInt(flag(args, "-repeat", "5")),
-            flag(args, "-impl", "vector").equals("vector"));
+            flag(args, "-impl", "vector"));
     if (o.n < 64
         || o.queries < 64
         || o.queries % 64 != 0
@@ -71,8 +78,13 @@ public final class CrossLanguage {
     }
     Workload<?> workload =
         switch (o.kind) {
-          case "uint64" -> new LongWorkload(o);
-          case "string" -> new StringWorkload(o);
+          case "uint64" -> o.impl.equals("packed") ? new PackedWorkload(o) : new LongWorkload(o);
+          case "string" -> {
+            if (o.impl.equals("packed")) {
+              throw new IllegalArgumentException("-impl packed takes uint64 keys only");
+            }
+            yield new StringWorkload(o);
+          }
           default -> throw new IllegalArgumentException("unknown key kind");
         };
     for (int r = 0; r < o.repeat; r++) {
@@ -157,7 +169,7 @@ public final class CrossLanguage {
       }
       System.out.printf(
           "%s,%s,%s,%s,%d,%d,%d,%.2f,%s,%d%n",
-          o.vector ? "java-vector" : "java",
+          o.vector() ? "java-vector" : o.impl.equals("packed") ? "java-packed" : "java",
           o.kind,
           o.mode,
           o.op,
@@ -243,7 +255,7 @@ public final class CrossLanguage {
 
     @Override
     LongLongBBTreeMap newMap() {
-      return o.vector
+      return o.vector()
           ? VectorBBTreeMaps.createLongLong(VectorBBTreeMaps.Mode.COUNT)
           : new LongLongBBTreeMap();
     }
@@ -296,9 +308,81 @@ public final class CrossLanguage {
     }
   }
 
+  /** The uint64 workload on {@link PackedLongMap}, with {@code -impl packed}. */
+  static final class PackedWorkload extends Workload<PackedLongMap> {
+    private final long[] keys;
+    private final long[] queries;
+
+    PackedWorkload(Options o) {
+      super(o);
+      keys = new long[o.n];
+      for (int i = 0; i < o.n; i++) {
+        keys[i] = mix(2L * i) ^ Long.MIN_VALUE;
+      }
+      queries = new long[o.queries];
+      for (int i = 0; i < o.queries; i++) {
+        queries[i] = queryKey(i) ^ Long.MIN_VALUE;
+      }
+    }
+
+    @Override
+    PackedLongMap newMap() {
+      return new PackedLongMap();
+    }
+
+    @Override
+    long put(PackedLongMap map, boolean query, int i, long value) {
+      return map.put(query ? queries[i] : keys[i], value, 0);
+    }
+
+    @Override
+    long get(PackedLongMap map, int query) {
+      return map.get(queries[query], 0);
+    }
+
+    @Override
+    long remove(PackedLongMap map, int key) {
+      return map.remove(keys[key], 0);
+    }
+
+    @Override
+    Object newBuffers() {
+      return new long[][] {new long[64], new long[64]};
+    }
+
+    @Override
+    long getMany(PackedLongMap map, int from, int to, Object buffers) {
+      long[][] b = (long[][]) buffers;
+      long[] batch = b[0];
+      long[] values = b[1];
+      int n = to - from;
+      if (n != batch.length) {
+        batch = Arrays.copyOfRange(queries, from, to);
+        values = new long[n];
+      } else {
+        System.arraycopy(queries, from, batch, 0, n);
+      }
+      map.getMany(batch, values, 0);
+      long sum = 0;
+      for (int i = 0; i < n; i++) {
+        sum += values[i];
+      }
+      return sum;
+    }
+
+    @Override
+    long scan64(PackedLongMap map, int query) {
+      FirstValues first = new FirstValues();
+      map.forEachFrom(queries[query], first);
+      return first.sum;
+    }
+  }
+
   /** Adds the values of the first 64 entries of a scan, with no object for each entry. */
   static final class FirstValues
-      implements LongLongBBTreeMap.EntryPredicate, BiPredicate<Object, Long> {
+      implements LongLongBBTreeMap.EntryPredicate,
+          PackedLongMap.EntryPredicate,
+          BiPredicate<Object, Long> {
     long sum;
     int count;
 
@@ -339,7 +423,7 @@ public final class CrossLanguage {
 
     @Override
     BBTreeMap<String, Long> newMap() {
-      return o.vector
+      return o.vector()
           ? VectorBBTreeMaps.create(InlineKey.STRING, VectorBBTreeMaps.Mode.COUNT)
           : new BBTreeMap<>(InlineKey.STRING);
     }
