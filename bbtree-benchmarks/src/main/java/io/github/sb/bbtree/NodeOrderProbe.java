@@ -21,8 +21,10 @@ import java.util.SplittableRandom;
  * leaves in random order), {@code bfs} (level by level).
  *
  * <p>Arguments: the order, the mode ({@code hit-cold} or {@code miss-cold}), optionally the
- * number of lookups, and optionally {@code churn}: garbage after the copy, so that young
- * collections copy the new nodes.
+ * number of lookups, and optionally {@code churn} (16 GB of garbage after the copy, so that young
+ * collections move the nodes) or {@code prebox} (keys boxed before the build). With {@code
+ * -Donly=map} or {@code -Donly=copy}, it prints READY and then does lookups on one tree only, for
+ * {@code perf stat}.
  */
 public final class NodeOrderProbe {
 
