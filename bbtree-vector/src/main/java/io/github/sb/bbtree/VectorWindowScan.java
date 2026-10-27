@@ -30,21 +30,21 @@ final class VectorWindowScan {
   static final WindowScan COUNT =
       new WindowScan() {
         @Override
-        public long scan(long[] windows, int n, long target) {
+        public long scan(long[] windows, int from, int n, long target) {
           LongVector t = LongVector.broadcast(SPECIES, target);
           LongVector below = LongVector.zero(SPECIES);
           LongVector equal = LongVector.zero(SPECIES);
           int bound = SPECIES.loopBound(n);
           int i = 0;
           for (; i < bound; i += SPECIES.length()) {
-            LongVector v = LongVector.fromArray(SPECIES, windows, i);
+            LongVector v = LongVector.fromArray(SPECIES, windows, from + i);
             below = below.sub(v.compare(VectorOperators.LT, t).toVector());
             equal = equal.sub(v.compare(VectorOperators.EQ, t).toVector());
           }
           int lt = (int) below.reduceLanes(VectorOperators.ADD);
           int eq = (int) equal.reduceLanes(VectorOperators.ADD);
           for (; i < n; i++) {
-            long w = windows[i];
+            long w = windows[from + i];
             lt += w < target ? 1 : 0;
             eq += w == target ? 1 : 0;
           }
@@ -75,13 +75,13 @@ final class VectorWindowScan {
   static final WindowScan SCAN =
       new WindowScan() {
         @Override
-        public long scan(long[] windows, int n, long target) {
+        public long scan(long[] windows, int from, int n, long target) {
           LongVector t = LongVector.broadcast(SPECIES, target);
           int bound = SPECIES.loopBound(n);
           int lo = 0;
           while (lo < bound) {
             VectorMask<Long> notSmaller =
-                LongVector.fromArray(SPECIES, windows, lo).compare(VectorOperators.GE, t);
+                LongVector.fromArray(SPECIES, windows, from + lo).compare(VectorOperators.GE, t);
             if (notSmaller.anyTrue()) {
               lo += notSmaller.firstTrue();
               break;
@@ -89,12 +89,12 @@ final class VectorWindowScan {
             lo += SPECIES.length();
           }
           if (lo >= bound) {
-            while (lo < n && windows[lo] < target) {
+            while (lo < n && windows[from + lo] < target) {
               lo++;
             }
           }
           int hi = lo;
-          while (hi < n && windows[hi] == target) {
+          while (hi < n && windows[from + hi] == target) {
             hi++;
           }
           return WindowScan.pack(lo, hi);

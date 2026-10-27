@@ -14,10 +14,10 @@ public final class SearchVariants {
   static final WindowScan BRANCHLESS =
       new WindowScan() {
         @Override
-        public long scan(long[] w, int n, long t) {
+        public long scan(long[] w, int from, int n, long t) {
           int lt = 0;
           int eq = 0;
-          for (int i = 0; i < n; i++) {
+          for (int i = from; i < from + n; i++) {
             long x = w[i];
             lt += x < t ? 1 : 0;
             eq += x == t ? 1 : 0;
@@ -45,8 +45,8 @@ public final class SearchVariants {
   static final WindowScan BINARY =
       new WindowScan() {
         @Override
-        public long scan(long[] w, int n, long t) {
-          int base = 0;
+        public long scan(long[] w, int from, int n, long t) {
+          int base = from;
           int len = n;
           while (len > 1) {
             int half = len >>> 1;
@@ -55,10 +55,10 @@ public final class SearchVariants {
           }
           int lo = base + (len == 1 && w[base] < t ? 1 : 0);
           int hi = lo;
-          while (hi < n && w[hi] == t) {
+          while (hi < from + n && w[hi] == t) {
             hi++;
           }
-          return WindowScan.pack(lo, hi);
+          return WindowScan.pack(lo - from, hi - from);
         }
 
         @Override

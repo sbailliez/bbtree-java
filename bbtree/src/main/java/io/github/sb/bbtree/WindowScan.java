@@ -7,16 +7,16 @@ package io.github.sb.bbtree;
 interface WindowScan {
 
   /**
-   * Gives the position of {@code target} in {@code windows[0, n)}, which is sorted.
+   * Gives the position of {@code target} in {@code windows[from, from + n)}, which is sorted.
    *
    * @return {@code lo << 32 | hi}, where {@code lo} is the number of windows that are smaller than
    *     {@code target}, and {@code hi - lo} is the number of windows that are equal to it
    */
-  long scan(long[] windows, int n, long target);
+  long scan(long[] windows, int from, int n, long target);
 
   /**
    * Gives the position of {@code target} in the 4-byte windows {@code windows[0, n)}, as {@link
-   * #scan(long[], int, long)} does. The slots from {@code n} to the end of the array hold {@link
+   * #scan(long[], int, int, long)} does. The slots from {@code n} to the end of the array hold {@link
    * Integer#MAX_VALUE}, and the array length is a multiple of {@link BBTreeMap#NARROW_ALIGNMENT},
    * so a vector scan can read whole registers after {@code n} with no mask.
    */
@@ -35,16 +35,17 @@ interface WindowScan {
   WindowScan SCALAR =
       new WindowScan() {
         @Override
-        public long scan(long[] windows, int n, long target) {
-          int lo = 0;
-          while (lo < n && windows[lo] < target) {
+        public long scan(long[] windows, int from, int n, long target) {
+          int end = from + n;
+          int lo = from;
+          while (lo < end && windows[lo] < target) {
             lo++;
           }
           int hi = lo;
-          while (hi < n && windows[hi] == target) {
+          while (hi < end && windows[hi] == target) {
             hi++;
           }
-          return pack(lo, hi);
+          return pack(lo - from, hi - from);
         }
 
         @Override

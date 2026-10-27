@@ -3,7 +3,7 @@ package io.github.sb.bbtree;
 /**
  * A leaf node: the entries, and the link to the next leaf in key order. A leaf keeps its values in
  * {@link #values}, or, in a map of primitive {@code long} values, in {@link #longValues}. Exactly
- * one of the two is not {@code null}.
+ * one of the two is not {@code null}, and it is the body of the leaf.
  */
 final class Leaf extends Node {
 
@@ -17,8 +17,13 @@ final class Leaf extends Node {
   Leaf next;
 
   Leaf(int capacity, boolean inline, boolean primitiveValues) {
-    super(capacity, inline);
+    super(capacity, inline, true);
     this.values = primitiveValues ? null : new Object[capacity];
     this.longValues = primitiveValues ? new long[capacity] : null;
+  }
+
+  @Override
+  Object body() {
+    return values != null ? values : longValues;
   }
 }

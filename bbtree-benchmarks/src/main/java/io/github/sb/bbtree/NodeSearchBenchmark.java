@@ -77,6 +77,6 @@ public class NodeSearchBenchmark {
   public long search() {
     int i = next;
     next = (i + 1) & (SEARCHES - 1);
-    return windowScan.scan(windows[order[i]], n, targets[i]);
+    return windowScan.scan(windows[order[i]], 0, n, targets[i]);
   }
 }

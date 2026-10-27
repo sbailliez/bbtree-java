@@ -52,26 +52,26 @@ public final class WindowTieAnalysis {
   private static void walk(Node node, int fixed, long[][] stats) {
     int level = node instanceof Leaf ? 1 : 0;
     long[] s = stats[level];
-    int n = node.count;
+    int n = node.count();
     s[0] += n;
     for (int w = 0; w < WIDTHS.length; w++) {
       int bits = WIDTHS[w] * 8;
       for (int i = 0; i < n; i++) {
-        long cut = cut(node.windows[i], bits);
+        long cut = cut(node.head[Node.W + i], bits);
         boolean tie =
-            (i > 0 && cut(node.windows[i - 1], bits) == cut)
-                || (i + 1 < n && cut(node.windows[i + 1], bits) == cut);
+            (i > 0 && cut(node.head[Node.W + i - 1], bits) == cut)
+                || (i + 1 < n && cut(node.head[Node.W + i + 1], bits) == cut);
         if (tie) {
           s[1 + w]++;
         }
       }
-      if (fixed > 0 && node.prefix + WIDTHS[w] >= fixed) {
+      if (fixed > 0 && node.prefix() + WIDTHS[w] >= fixed) {
         s[1 + WIDTHS.length + w] += n;
       }
     }
     if (node instanceof Inner inner) {
       for (int i = 0; i <= n; i++) {
-        walk(inner.children[i], fixed, stats);
+        walk(inner.child(i), fixed, stats);
       }
     }
   }

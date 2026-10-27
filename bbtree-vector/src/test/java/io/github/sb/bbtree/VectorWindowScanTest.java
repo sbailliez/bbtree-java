@@ -22,10 +22,16 @@ class VectorWindowScanTest {
       }
       Arrays.sort(windows, 0, n);
       long target = (random.nextInt(11) - 5) * (Long.MAX_VALUE / 4);
-      long expected = WindowScan.SCALAR.scan(windows, n, target);
+      // The windows of a node start at slot Node.W of its head.
+      long[] head = new long[Node.W + windows.length];
+      System.arraycopy(windows, 0, head, Node.W, windows.length);
+      long expected = WindowScan.SCALAR.scan(windows, 0, n, target);
       String at = "n " + n + ", target " + target + ", " + Arrays.toString(windows);
-      assertEquals(expected, VectorWindowScan.COUNT.scan(windows, n, target), "COUNT " + at);
-      assertEquals(expected, VectorWindowScan.SCAN.scan(windows, n, target), "SCAN " + at);
+      assertEquals(expected, WindowScan.SCALAR.scan(head, Node.W, n, target), "SCALAR " + at);
+      assertEquals(expected, VectorWindowScan.COUNT.scan(windows, 0, n, target), "COUNT " + at);
+      assertEquals(expected, VectorWindowScan.SCAN.scan(windows, 0, n, target), "SCAN " + at);
+      assertEquals(expected, VectorWindowScan.COUNT.scan(head, Node.W, n, target), "COUNT " + at);
+      assertEquals(expected, VectorWindowScan.SCAN.scan(head, Node.W, n, target), "SCAN " + at);
     }
   }
 
