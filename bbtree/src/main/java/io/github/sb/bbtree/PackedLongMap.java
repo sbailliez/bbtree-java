@@ -24,8 +24,13 @@ import java.util.concurrent.atomic.LongAdder;
  * leaves need no links.
  *
  * <p>A map cannot hold {@code null}, so the methods that may find no entry take the value to give
- * back in that case: {@code absent}. A removal leaves an empty leaf in the tree; the map does not
- * merge nodes.
+ * back in that case: {@code absent}.
+ *
+ * <p><b>Removal.</b> A removal that empties a leaf removes the empty subtree from its parent: the
+ * empty leaf, and the inner nodes above it that have no other child. No entries move, because the
+ * range of the neighbor grows to cover the range of the removed child. A root with one child gives
+ * its place to the child. This is best effort under contention. The map does not merge nodes that
+ * are not empty.
  */
 public final class PackedLongMap {
 
@@ -655,8 +660,154 @@ public final class PackedLongMap {
       setCount(node, n - 1);
       unlock(node);
       size.decrement();
+      if (n == 1) {
+        compact(key);
+      }
       return old;
     }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Compaction
+
+  /** The most passes of {@link #compact} after one removal. */
+  private static final int COMPACT_PASSES = 64;
+
+  /**
+   * Removes the empty subtrees on the path of {@code key}, after a removal emptied a leaf. Each
+   * pass removes one empty subtree, or makes the tree lower if the root has one child. If a node
+   * changes during a pass, the pass stops, and the empty nodes stay until a later removal on their
+   * path.
+   */
+  private void compact(long key) {
+    for (int pass = 0; pass < COMPACT_PASSES; pass++) {
+      if (!compactOnce(key)) {
+        return;
+      }
+    }
+  }
+
+  /** Does one pass of {@link #compact}. Gives {@code true} if it changed the tree. */
+  private boolean compactOnce(long key) {
+    Root r = root;
+    long[] node = r.node();
+    Object[] children = r.children();
+    long v = version(node);
+    if (isLocked(v) || r != root) {
+      return false;
+    }
+    try {
+      if (!isLeaf(node) && count(node) == 0) {
+        return lowerRoot(r, v);
+      }
+      while (!isLeaf(node)) {
+        int i = childIndex(node, key);
+        long[] child = (long[]) children[2 * i];
+        Object[] grandchildren = (Object[]) children[2 * i + 1];
+        long cv = version(child);
+        if (isLocked(cv) || !validate(node, v)) {
+          return false;
+        }
+        if (count(node) > 0) {
+          Object[] empty = emptySubtree(child, grandchildren, cv);
+          if (empty != null) {
+            return removeEmpty(node, children, v, i, (long[][]) empty[0], (long[]) empty[1]);
+          }
+        }
+        node = child;
+        children = grandchildren;
+        v = cv;
+      }
+      return false;
+    } catch (RuntimeException e) {
+      // A torn read during a write of another thread. Compaction is optional, and runs no user
+      // code, so the pass only stops.
+      return false;
+    }
+  }
+
+  /**
+   * Gives {nodes, versions} of the subtree under {@code node} if it holds no entry: an empty
+   * leaf, or inner nodes with one child each down to an empty leaf. Gives {@code null} otherwise,
+   * or if a node changed.
+   */
+  private Object[] emptySubtree(long[] node, Object[] children, long v) {
+    long[][] nodes = new long[8][];
+    long[] versions = new long[8];
+    int depth = 0;
+    while (true) {
+      if (count(node) != 0) {
+        return null;
+      }
+      if (depth == nodes.length) {
+        nodes = java.util.Arrays.copyOf(nodes, 2 * depth);
+        versions = java.util.Arrays.copyOf(versions, 2 * depth);
+      }
+      nodes[depth] = node;
+      versions[depth] = v;
+      depth++;
+      if (isLeaf(node)) {
+        return new Object[] {
+          java.util.Arrays.copyOf(nodes, depth), java.util.Arrays.copyOf(versions, depth)
+        };
+      }
+      long[] child = (long[]) children[0];
+      Object[] grandchildren = (Object[]) children[1];
+      long cv = version(child);
+      if (isLocked(cv) || !validate(node, v)) {
+        return null;
+      }
+      node = child;
+      children = grandchildren;
+      v = cv;
+    }
+  }
+
+  /**
+   * Removes the empty subtree at child {@code slot} of {@code parent}, which has at least one
+   * separator, if no node changed since the versions that the caller read. The nodes of the
+   * subtree stay locked for ever, so that every reader that still holds one starts again.
+   */
+  private boolean removeEmpty(
+      long[] parent, Object[] children, long pv, int slot, long[][] nodes, long[] versions) {
+    if (!tryLock(parent, pv)) {
+      return false;
+    }
+    for (int k = 0; k < nodes.length; k++) {
+      if (!tryLock(nodes[k], versions[k])) {
+        for (int j = 0; j < k; j++) {
+          unlockUnchanged(nodes[j]);
+        }
+        unlockUnchanged(parent);
+        return false;
+      }
+    }
+    // The child at slot covers [separator slot - 1, separator slot). Remove the separator on its
+    // left, so that the left neighbor covers its range, or the first one for child 0, so that the
+    // right neighbor does.
+    int n = count(parent);
+    int separator = slot > 0 ? slot - 1 : 0;
+    System.arraycopy(parent, K + separator + 1, parent, K + separator, n - separator - 1);
+    System.arraycopy(children, 2 * (slot + 1), children, 2 * slot, 2 * (n - slot));
+    children[2 * n] = null;
+    children[2 * n + 1] = null;
+    setCount(parent, n - 1);
+    unlock(parent);
+    return true;
+  }
+
+  /** Makes the only child of the root the new root. The old root stays locked. */
+  private boolean lowerRoot(Root r, long v) {
+    long[] top = r.node();
+    if (!tryLock(top, v)) {
+      return false;
+    }
+    if (root != r || count(top) != 0) {
+      unlockUnchanged(top);
+      return false;
+    }
+    root = new Root((long[]) r.children()[0], (Object[]) r.children()[1]);
+    return true;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -797,6 +948,23 @@ public final class PackedLongMap {
     return h;
   }
 
+  /** Gives the number of empty leaves. */
+  int emptyLeafCount() {
+    Root r = root;
+    return emptyLeaves(r.node(), r.children());
+  }
+
+  private static int emptyLeaves(long[] node, Object[] children) {
+    if (isLeaf(node)) {
+      return count(node) == 0 ? 1 : 0;
+    }
+    int empty = 0;
+    for (int i = 0; i <= count(node); i++) {
+      empty += emptyLeaves((long[]) children[2 * i], (Object[]) children[2 * i + 1]);
+    }
+    return empty;
+  }
+
   /**
    * Checks the structure of the tree and gives the number of entries. Call it only when no write
    * runs.
@@ -843,7 +1011,6 @@ public final class PackedLongMap {
       check(leafDepth[0] == depth, "leaves at different depths");
       return n;
     }
-    check(n > 0 || depth == 0, "an empty inner node below the root");
     check(children != null && children.length == 2 * (innerCapacity + 1), "wrong pairs");
     for (int i = n + 1; i <= innerCapacity; i++) {
       check(children[2 * i] == null && children[2 * i + 1] == null, "stale child at " + i);

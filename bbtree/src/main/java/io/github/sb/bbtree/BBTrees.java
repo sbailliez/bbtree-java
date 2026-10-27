@@ -86,8 +86,7 @@ public final class BBTrees {
   /**
    * Makes the fastest map of primitive {@code long} keys to primitive {@code long} values. Each
    * node is a {@code long[]} that holds the keys and the values themselves, as the nodes of the
-   * Rust bbtree do, so the map has no key, value or node objects. It has no {@code Map} view, and
-   * a removal leaves an empty leaf in the tree: it does not merge nodes.
+   * Rust bbtree do, so the map has no key, value or node objects. It has no {@code Map} view.
    *
    * @return the map
    */

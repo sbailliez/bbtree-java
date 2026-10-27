@@ -97,7 +97,7 @@ Measured differences, with 1M entries:
   batch lookups 18% to 31% faster, scans of 64 entries 58% to 67% faster.
 - `packed` against `longToLong`, with the same workloads and machines: hits 25% to 48% faster,
   inserts 22% to 40% faster, scans 15% to 50% faster, batch lookups between 7% slower and 22%
-  faster.
+  faster. With the removal of empty nodes, deletes were 39% to 55% faster.
 - The vector maps were slower than the scalar maps on Graviton3, Zen 5 and Sapphire Rapids
   ([docs/node-search-cpus.md](docs/node-search-cpus.md)), and faster for cold lookups on the
   Apple M5.
@@ -107,8 +107,9 @@ The costs of each step:
 - `BBTreeMap` takes any key and value type and is a full `ConcurrentMap`.
 - `LongBBTreeMap` and `LongLongBBTreeMap` keep a `Long` object for each key, for the separators
   and the `Map` view, so their memory per entry is larger than that of `packed`.
-- `PackedLongMap` takes only `long` keys and `long` values, has no `Map` view, and does not merge
-  nodes: a removal leaves an empty leaf in the tree.
+- `PackedLongMap` takes only `long` keys and `long` values, and has no `Map` view. A removal that
+  empties a leaf removes the empty nodes, as in `BBTreeMap`; neither map merges nodes that are not
+  empty.
 
 ### Use cases
 
@@ -144,8 +145,7 @@ Examples:
   threads read the book. The maps iterate in ascending order only, so keep the bids with the
   price negated, so that the best bid is the first key. With the price as a `long` number of ticks
   and the quantity as a `long`,
-  use `BBTrees.packed()` for the speed, or `BBTrees.longToLong()` when a level must be removed
-  when its quantity becomes 0, because `PackedLongMap` leaves an empty leaf after removals.
+  use `BBTrees.packed()`, and remove a level when its quantity becomes 0.
 - **A map that many threads share.** Any sorted map that one lock protects today, for example
   sessions sorted by expiry time that a cleaner thread scans, while request threads add and touch
   sessions, with the expiry time and the session ID as a composite key. A write locks only the
@@ -173,7 +173,7 @@ A sorted map is not the best choice when:
   removal semantics: counters, offsets, an ID to an ID.
 - `BBTrees.packed()`: the fastest `long` to `long` index, where the map only grows or changes
   values: a timestamp to a file offset, a sequence number to a position, a price level to a
-  quantity. It has no `Map` view, and removals leave empty leaves.
+  quantity. It has no `Map` view.
 - `VectorBBTreeMaps` (module bbtree-vector): experiments with the Java Vector API. On the CPUs of
   the measurements, it was faster only for lookups of cold keys on Apple silicon.
 
@@ -485,7 +485,8 @@ Differences in the workload:
   where Rust uses its single-thread map and Go its `Map`.
 - The `string` values in Java are `Long` objects. A hit reads the value object, where Go and Rust
   read a `u64` in the leaf. The `uint64` maps keep primitive values.
-- `PackedLongMap` does not merge nodes, so its deletes do less work than the others.
+- The `PackedLongMap` delete rows ran before it removed empty nodes. With the removal of empty
+  nodes, deletes took 0.82 to 1.81 times the Rust time ([docs/cross-language.md](docs/cross-language.md)).
 
 With 8 threads, Java inserts were faster than Rust on the three EC2 machines (0.61 to 0.87 times
 the Rust time), and 3.7 to 5.9 times faster than Go. With `PackedLongMap`, `uint64` hits took 1.05

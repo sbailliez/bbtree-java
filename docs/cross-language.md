@@ -22,7 +22,9 @@ The Apple M5 ran before `PackedLongMap` existed, so its row has the other Java m
   Rust time on one thread and 0.82 to 0.89 times in the concurrent map, and inserts 1.06 times on
   one thread and 0.61 times with 8 threads. On Zen 5 and Sapphire Rapids, hits took 1.26 to 2.79
   times the Rust time, and inserts 0.63 to 1.27 times.
-- **Its deletes are not comparable:** `PackedLongMap` leaves empty leaves and merges no nodes.
+- **Deletes:** the tables below ran before `PackedLongMap` removed empty nodes, so its delete
+  rows there do less work. With the removal of empty nodes, a later run of 3 rounds gave deletes
+  of 0.82 (Graviton3), 1.12 (Zen 5) and 1.81 (Sapphire Rapids) times the Rust time.
 - **Batch lookups** stay the largest gap: 1.72 to 3.96 times the Rust time for `uint64` keys.
 - **`string` keys** use `BBTreeMap` with inline keys: hits took 1.08 to 1.57 times the Rust time
   on the three EC2 machines, and 90% hits with 10% overwrites on 8 threads took 0.66 to 0.82
@@ -60,7 +62,8 @@ Differences in the workload:
   where Rust uses its single-thread map and Go its `Map`.
 - The `string` values in Java are `Long` objects. A hit reads the value object, where Go and
   Rust read a `u64` in the leaf. The `uint64` maps keep primitive values.
-- `PackedLongMap` does not merge nodes, so its deletes do less work than the others.
+- The `PackedLongMap` delete rows ran before it removed empty nodes, so they do less work than
+  the others. The summary gives the later delete times.
 
 ### Apple M5 Pro
 

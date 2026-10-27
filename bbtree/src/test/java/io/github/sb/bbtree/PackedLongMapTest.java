@@ -20,9 +20,15 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+/**
+ * A defect of the locks can make a descent wait for ever, so each test has a time limit. A spin
+ * loop does not see an interrupt, so the limit runs the test in a separate thread.
+ */
+@Timeout(value = 60, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 class PackedLongMapTest {
 
   private static final long ABSENT = -7;
@@ -63,6 +69,9 @@ class PackedLongMapTest {
         }
         if (op % 6_000 == 0) {
           assertEquals(expected.size(), map.checkInvariants());
+          // On one thread, compaction always succeeds: the only empty leaf is the root of an
+          // empty map.
+          assertEquals(expected.isEmpty() ? 1 : 0, map.emptyLeafCount(), "empty leaves");
           checkGetMany(map, expected, keys);
         }
       }
@@ -279,5 +288,115 @@ class PackedLongMapTest {
       pool.shutdownNow();
     }
     assertEquals(map.size(), map.checkInvariants());
+  }
+
+  @Test
+  void removingEveryKeyLeavesOneEmptyLeaf() {
+    PackedLongMap map = new PackedLongMap(4, 4);
+    List<Long> keys = new ArrayList<>();
+    for (long k = 0; k < 50_000; k++) {
+      keys.add(k * 7919 % 50_000);
+    }
+    for (long k : keys) {
+      map.put(k, k, ABSENT);
+    }
+    assertTrue(map.height() >= 6);
+    java.util.Collections.shuffle(keys, new Random(3));
+    for (int i = 0; i < keys.size(); i++) {
+      assertEquals(keys.get(i), map.remove(keys.get(i), ABSENT));
+      if (i % 5_000 == 0) {
+        assertEquals(keys.size() - i - 1, map.checkInvariants());
+        assertEquals(0, map.emptyLeafCount());
+      }
+    }
+    assertEquals(0, map.checkInvariants());
+    assertEquals(1, map.height());
+    assertEquals(1, map.emptyLeafCount());
+    assertTrue(map.isEmpty());
+    map.put(5, 6, ABSENT);
+    assertEquals(6, map.get(5, ABSENT));
+  }
+
+  @Test
+  void lookupsSeeSteadyKeysWhileEmptyLeavesAreRemoved() throws Exception {
+    PackedLongMap map = new PackedLongMap(4, 4);
+    int steady = 1_024;
+    // The steady keys are multiples of 2^20. The writers insert keys between them and remove
+    // them again, so leaves that hold only such keys empty out and leave the tree.
+    for (long i = 0; i < steady; i++) {
+      map.put(i << 20, -(i << 20), ABSENT);
+    }
+    int threads = Math.max(4, Runtime.getRuntime().availableProcessors());
+    AtomicBoolean stop = new AtomicBoolean();
+    ExecutorService pool = Executors.newFixedThreadPool(threads);
+    try {
+      List<Future<?>> writers = new ArrayList<>();
+      List<Future<?>> readers = new ArrayList<>();
+      for (int t = 0; t < threads / 2; t++) {
+        // Each writer has its own keys in a gap, so that it removes only keys that it put.
+        long offset = 1 + 64L * t;
+        writers.add(
+            pool.submit(
+                () -> {
+                  ThreadLocalRandom r = ThreadLocalRandom.current();
+                  long[] mine = new long[64];
+                  for (int n = 0; n < 200_000 && !stop.get(); n++) {
+                    // A run of keys in one gap, then their removal, so that whole leaves empty.
+                    long base = (long) r.nextInt(steady) << 20;
+                    for (int j = 0; j < mine.length; j++) {
+                      mine[j] = base + offset + j;
+                      map.put(mine[j], -mine[j], ABSENT);
+                    }
+                    for (long k : mine) {
+                      assertEquals(-k, map.remove(k, ABSENT));
+                    }
+                    n += mine.length;
+                  }
+                }));
+      }
+      for (int t = threads / 2; t < threads; t++) {
+        readers.add(
+            pool.submit(
+                () -> {
+                  ThreadLocalRandom r = ThreadLocalRandom.current();
+                  long[] keys = new long[16];
+                  long[] values = new long[16];
+                  while (!stop.get()) {
+                    long k = (long) r.nextInt(steady) << 20;
+                    assertEquals(-k, map.get(k, ABSENT), "get " + k);
+                    for (int j = 0; j < keys.length; j++) {
+                      keys[j] = (long) r.nextInt(steady) << 20;
+                    }
+                    map.getMany(keys, values, ABSENT);
+                    for (int j = 0; j < keys.length; j++) {
+                      assertEquals(-keys[j], values[j], "getMany " + keys[j]);
+                    }
+                    int[] seen = {0};
+                    long[] last = {Long.MIN_VALUE};
+                    map.forEachFrom(k, (key, v) -> {
+                      assertTrue(key > last[0], "order");
+                      last[0] = key;
+                      if ((key & ((1L << 20) - 1)) == 0) {
+                        seen[0]++;
+                      }
+                      return seen[0] < 8;
+                    });
+                    assertEquals(Math.min(8, steady - (int) (k >> 20)), seen[0], "scan from " + k);
+                  }
+                  return null;
+                }));
+      }
+      for (Future<?> w : writers) {
+        w.get(120, TimeUnit.SECONDS);
+      }
+      stop.set(true);
+      for (Future<?> reader : readers) {
+        reader.get(10, TimeUnit.SECONDS);
+      }
+    } finally {
+      stop.set(true);
+      pool.shutdownNow();
+    }
+    assertEquals(steady, map.checkInvariants());
   }
 }
