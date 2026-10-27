@@ -1,12 +1,47 @@
 # bbtree-java
 
-A concurrent sorted map for Java: a B+ tree with inline keys and optimistic lock coupling.
-It is a Java implementation of the design of [bbtree](https://github.com/XiangpengHao/bbtree)
-by Xiangpeng Hao. The design is explained in the post
-[bbtree: fastest ordered map](https://bbtree.xiangpeng.systems/post/).
+[![build](https://github.com/sbailliez/bbtree-java/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sbailliez/bbtree-java/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-`BBTreeMap` implements `java.util.concurrent.ConcurrentMap`. Use it where you use
-`ConcurrentSkipListMap`, or a `TreeMap` behind a lock.
+**bbtree-java is a fast concurrent sorted map for the JVM.** It brings the design of
+[bbtree](https://github.com/XiangpengHao/bbtree), the Rust ordered map by
+[Xiangpeng Hao](https://xiangpeng.systems/), to Java: a B+ tree with inline keys and optimistic
+lock coupling.
+
+This is a hobby port, made for fun with Claude Opus 5.5 (medium effort). The aim was to see how
+close Java can get to the performance of the Rust original and of its Go port,
+[bbtree-go](https://github.com/richardartoul/bbtree-go). The performance was measured on AWS
+c7g.4xlarge (Graviton3), c8a.4xlarge (AMD Zen 5) and c7i.4xlarge (Intel Sapphire Rapids), and on
+an Apple M5 Pro (local). All the credit for the design goes to Xiangpeng Hao. The port can
+certainly be made faster: batch lookups still take 1.7 to 4.0 times the Rust time, and
+[Possible next steps](#possible-next-steps) lists ideas that are not done yet.
+
+1. **Close to the Rust original.** On AWS Graviton3, `PackedLongMap` lookups and inserts on one
+   thread take at most 6% more time than in the Rust bbtree. With 8 threads, its inserts were
+   1.4 to 1.6 times faster than Rust on Graviton3, AMD Zen 5 and Intel Sapphire Rapids. Rust
+   stays ahead on x86 lookups and on batch lookups (see below).
+2. **Many times faster than the JDK maps.** With 16 threads, `BBTreeMap` does 3.6 to 5.4 times the
+   throughput of `ConcurrentSkipListMap`. On one thread, its lookups are 1.8 to 3.6 times faster
+   than `TreeMap`, and its scans 9 to 11 times faster (Apple M5).
+3. **A drop-in `ConcurrentMap`.** `BBTreeMap` implements `java.util.concurrent.ConcurrentMap`.
+   Use it where you use `ConcurrentSkipListMap`, or a `TreeMap` behind a lock.
+4. **Choose your trade-off.** Six kinds of map, from any key type to `long` keys and `long` values
+   with no objects at all. `BBTrees` makes each one.
+5. **Zero dependencies.** Java 21 or later. The optional Vector API module needs Java 25.
+6. **Many tests.** About 3,000 tests: the `ConcurrentMap` contract suites of Guava, differential
+   tests against `TreeMap`, and concurrency tests on Arm and x86. Deliberate defects in the lock
+   paths make the tests fail.
+
+![bbtree-java against the Rust bbtree and the Go port, concurrent insert with 8 threads](docs/assets/race-insert.svg)
+
+![bbtree-java against the Rust bbtree and the Go port, concurrent get with 8 threads](docs/assets/race-get.svg)
+
+The charts show AWS c7g (Graviton3), 1M `uint64` keys, the workloads of bbtree-go, median of 6
+rounds. On Zen 5 and Sapphire Rapids, single-thread lookups take 1.3 to 2.8 times the Rust time,
+and on all three CPUs batch lookups take 1.7 to 4.0 times.
+[docs/cross-language.md](docs/cross-language.md) gives all results on four CPUs.
+
+The design is explained in the post [bbtree: fastest ordered map](https://bbtree.xiangpeng.systems/post/).
 
 ## Usage
 
@@ -498,3 +533,11 @@ At 1M entries, it took 168 ns and 39 ns. The larger map thus added 118 ns in Jav
 Rust. A Java lookup reads more separate objects on each level: the node, its windows array and
 its children array, and at the end the value object. The node layout with fewer objects in
 "Possible next steps" addresses this.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). bbtree-java is a Java implementation
+of the design of [bbtree](https://github.com/XiangpengHao/bbtree) by
+[Xiangpeng Hao](https://xiangpeng.systems/), which is
+licensed under the MIT License or the Apache License, Version 2.0. [NOTICE](NOTICE) gives the
+attribution.

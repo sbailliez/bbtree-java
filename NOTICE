@@ -1,0 +1,6 @@
+bbtree-java
+Copyright 2026 Stephane Bailliez
+
+This product is a Java implementation of the design of bbtree
+(https://github.com/XiangpengHao/bbtree), Copyright (c) 2026 Xiangpeng Hao, licensed under the
+MIT License or the Apache License, Version 2.0.

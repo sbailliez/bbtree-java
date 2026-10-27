@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="276" viewBox="0 0 700 276" role="img" aria-label="concurrent get, 8 threads, 1M uint64 keys · AWS c7g · M ops/s: bbtree-java packed 38.5, Rust bbtree 34.3, Go bbtree-go 33.2, bbtree-java longToLong 28.5.">
+  <!-- docs/results/cross-language/c7g.csv: uint64, concurrent, 8 threads, hit; median of 6 rounds; 1000 / (ns per operation).
+       A ball's one-way trip takes 0.6 s × (the fastest throughput / its throughput). -->
+  <style>
+    text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 18px; font-weight: 600; fill: #18181b; }
+    .title { font-weight: 800; }
+    .muted { fill: #52525b; }
+    .ours { font-weight: 800; }
+    .value { text-anchor: end; }
+    .highlight { fill: #ffd60a; }
+    .track { stroke: #a1a1aa; stroke-width: 3; stroke-linecap: round; }
+    .ball { animation: bounce linear infinite alternate; }
+    @keyframes bounce { to { transform: translateX(250px); } }
+  </style>
+  <rect x="0.5" y="0.5" width="699" height="275" rx="12" fill="#fafafa" stroke="#d4d4d8"/>
+  <text class="title" x="28" y="40">concurrent get, 8 threads</text>
+  <text class="muted" x="28" y="66">1M uint64 keys · AWS c7g · M ops/s</text>
+  <rect class="highlight" x="22" y="86" width="228" height="26" rx="4"/>
+  <rect class="highlight" x="621" y="86" width="59" height="26" rx="4"/>
+  <text class="ours" x="28" y="106">bbtree-java packed</text>
+  <line class="track" x1="318" y1="98" x2="590" y2="98"/>
+  <circle class="ball" cx="329" cy="98" r="11" fill="#ffd60a" stroke="#18181b" stroke-width="2.5" style="animation-duration: 0.60s"/>
+  <text class="ours value" x="672" y="106">38.5</text>
+  <text class="" x="28" y="146">Rust bbtree</text>
+  <line class="track" x1="318" y1="138" x2="590" y2="138"/>
+  <circle class="ball" cx="329" cy="138" r="11" fill="#3f3f46" style="animation-duration: 0.67s"/>
+  <text class=" value" x="672" y="146">34.3</text>
+  <text class="" x="28" y="186">Go bbtree-go</text>
+  <line class="track" x1="318" y1="178" x2="590" y2="178"/>
+  <circle class="ball" cx="329" cy="178" r="11" fill="#3f3f46" style="animation-duration: 0.70s"/>
+  <text class=" value" x="672" y="186">33.2</text>
+  <rect class="highlight" x="22" y="206" width="276" height="26" rx="4"/>
+  <rect class="highlight" x="621" y="206" width="59" height="26" rx="4"/>
+  <text class="ours" x="28" y="226">bbtree-java longToLong</text>
+  <line class="track" x1="318" y1="218" x2="590" y2="218"/>
+  <circle class="ball" cx="329" cy="218" r="11" fill="#ffd60a" stroke="#18181b" stroke-width="2.5" style="animation-duration: 0.81s"/>
+  <text class="ours value" x="672" y="226">28.5</text>
+</svg>
