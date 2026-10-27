@@ -255,7 +255,8 @@ prefix of 0, so dense keys, such as the integers 0 to n − 1, would tie on 4 by
 nodes search the 8-byte windows. A tie on 4 bytes compares the separators.
 
 **Result: the vector `COUNT` with 4-byte inner windows makes `get` 5% to 22% faster than the
-scalar map, except for time-ordered `uuid7` keys. It makes inserts 23% to 33% slower.**
+scalar map, except for time-ordered `uuid7` keys. It makes inserts 23% to 33% slower. The
+vector count is faster when the key object is not in the cache, and slower when it is.**
 
 `GetBenchmark` and `PutBenchmark`, 4 forks of 3 iterations each, on a quiet machine. Time per
 operation in ns:
@@ -286,8 +287,23 @@ operation in ns:
 - A count over the full capacity, with no loop bound from the count of the node, was 10% faster
   at 1M keys and 8% slower at 10M `uuid4` keys. It reads the second cache line of the windows
   every time. The count stops at the last live register.
-- The insert cost is the same with both window widths, so it comes from the vector count. It is
-  not analyzed yet.
+- The insert cost is the same with both window widths, so it comes from the vector count. The
+  cache state of the key decides whether the count is faster than the scalar scan. On a map of 1M
+  `long` keys, with `containsKey`:
+
+  | Lookup keys | Scalar, ns | Vector, ns |
+  |---|--:|--:|
+  | In allocation order, so in the cache | 108 to 118 | 112 to 118 |
+  | Spread in memory, so each lookup starts with a cache miss on the key | 182 to 187 | 148 to 165 |
+
+  `GetBenchmark` looks up spread keys. `PutBenchmark` inserts the keys in allocation order. On
+  maps that fit in the cache (10,000 and 100,000 keys), the vector `get` was 13 ns slower. Thus
+  the vector count wins when the lookup waits for memory, and the scalar scan wins when the key
+  and the nodes are in the cache. A probable reason is that the scalar scan branches on each
+  compare: when the key arrives late, the CPU runs ahead on predicted branches and throws away
+  that work. The count has no such branch. This reason is not proven with hardware counters.
+  The insert path has no other cause: the vector maps allocate the same 38.5 bytes per insert,
+  and larger C2 inlining limits do not change the times.
 
 [docs/vector-apple-silicon.md](docs/vector-apple-silicon.md) gives the review of the vector design
 for Apple silicon, with the node search measurements. On a CPU with 512-bit vectors (AVX-512), the

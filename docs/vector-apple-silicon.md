@@ -224,7 +224,18 @@ Two results of the implementation differ from the recommendation:
   The full count always reads both. The count to the last live slot reads the second line only
   when the node has more than 32 separators.
 - **The vector maps make inserts 23% to 33% slower than the scalar map**, with both window
-  widths. The cause is not analyzed yet.
+  widths. The vector count is faster than the scalar scan only when the lookup waits for memory.
+  With `containsKey` on 1M `long` keys, keys spread in memory took 148 to 165 ns with the count
+  and 182 to 187 ns with the scalar scan. Keys in allocation order, which stay in the cache, took
+  112 to 118 ns and 108 to 118 ns. `PutBenchmark` inserts its keys in allocation order.
+  - Each vector search on the insert path adds time. The count in the 4-byte inner windows only
+    added 10 to 14 ns for each insert. The count in the leaves and the border nodes only added 19
+    to 20 ns.
+  - Leaves of 16 entries, whose windows take one cache line, keep the same extra time.
+  - The vector maps allocate the same 38.5 bytes per insert as the scalar map, so C2 does not
+    make vector objects. Larger C2 inlining limits do not change the times.
+  - A probable reason is the cost of a branch that the CPU predicts before the key arrives. It is
+    not proven with hardware counters.
 
 ## How to run the measurements
 
