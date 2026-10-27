@@ -231,9 +231,10 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
    * Does {@link #find(Node, Object)} on the head of {@code node}. The search reads {@code node}
    * only when two windows tie, for its keys.
    */
-  private int find(long[] head, Node node, K key) {
+  private int find(long[] head, Object node, K key) {
     if (head.length == Node.W) {
-      return findKey(node.keys, 0, Math.min(Node.count(head), node.keys.length), key);
+      Object[] keys = ((Node) node).keys;
+      return findKey(keys, 0, Math.min(Node.count(head), keys.length), key);
     }
     int prefix = Node.prefix(head);
     long position = scan.scan(head, Node.W, windowCount(head), window(key, prefix));
@@ -245,7 +246,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     if (prefix >= exactFrom) {
       return lo;
     }
-    return findKey(node.keys, lo, hi, key);
+    return findKey(((Node) node).keys, lo, hi, key);
   }
 
   /** Searches {@code keys[lo, hi)} with the comparator. Gives the same result as {@link #find}. */
@@ -274,7 +275,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
    * Does {@link #childIndex(Inner, Object)} on the head of {@code node}. The search reads {@code
    * node} only when two windows tie, and in a map with 4-byte inner windows.
    */
-  private int childIndex(long[] head, Node node, K key) {
+  private int childIndex(long[] head, Object node, K key) {
     int prefix = Node.prefix(head);
     if (narrow) {
       Inner inner = (Inner) node;
@@ -291,7 +292,8 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       }
     }
     if (head.length == Node.W) {
-      return upperBound(node.keys, 0, Math.min(Node.count(head), node.keys.length), key);
+      Object[] keys = ((Node) node).keys;
+      return upperBound(keys, 0, Math.min(Node.count(head), keys.length), key);
     }
     long position = scan.scan(head, Node.W, windowCount(head), window(key, prefix));
     int lo = (int) (position >>> 32);
@@ -299,7 +301,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     if (lo == hi || prefix >= exactFrom) {
       return hi;
     }
-    return upperBound(node.keys, lo, hi, key);
+    return upperBound(((Node) node).keys, lo, hi, key);
   }
 
   /**
@@ -354,7 +356,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   }
 
   /** Does {@link #childIndexLong(Inner, long)} on the head of {@code node}. */
-  private int childIndexLong(long[] head, Node node, long key) {
+  private int childIndexLong(long[] head, Object node, long key) {
     int prefix = Node.prefix(head);
     if (narrow) {
       Inner inner = (Inner) node;
@@ -401,11 +403,12 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
     K k = key(key);
     restart:
     while (true) {
-      Node node = root;
-      long[] head = node.head;
-      Object body = node.body();
+      Node top = root;
+      Object node = top;
+      long[] head = top.head;
+      Object body = top.body();
       long v = Node.version(head);
-      if (Node.isLocked(v) || node != root) {
+      if (Node.isLocked(v) || top != root) {
         Thread.onSpinWait();
         continue;
       }
@@ -413,7 +416,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         while (!Node.isLeaf(head)) {
           Object[] slots = (Object[]) body;
           int i = childIndex(head, node, k);
-          Node child = Inner.child(slots, i);
+          Object child = Inner.childObject(slots, i);
           long[] childHead = Inner.childHead(slots, i);
           Object childBody = Inner.childBody(slots, i);
           long cv = Node.version(childHead);
@@ -464,11 +467,12 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   V getLong(long key) {
     restart:
     while (true) {
-      Node node = root;
-      long[] head = node.head;
-      Object body = node.body();
+      Node top = root;
+      Object node = top;
+      long[] head = top.head;
+      Object body = top.body();
       long v = Node.version(head);
-      if (Node.isLocked(v) || node != root) {
+      if (Node.isLocked(v) || top != root) {
         Thread.onSpinWait();
         continue;
       }
@@ -476,7 +480,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         while (!Node.isLeaf(head)) {
           Object[] slots = (Object[]) body;
           int i = childIndexLong(head, node, key);
-          Node child = Inner.child(slots, i);
+          Object child = Inner.childObject(slots, i);
           long[] childHead = Inner.childHead(slots, i);
           Object childBody = Inner.childBody(slots, i);
           long cv = Node.version(childHead);
@@ -512,11 +516,12 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   long getLongValue(long key, long absent) {
     restart:
     while (true) {
-      Node node = root;
-      long[] head = node.head;
-      Object body = node.body();
+      Node top = root;
+      Object node = top;
+      long[] head = top.head;
+      Object body = top.body();
       long v = Node.version(head);
-      if (Node.isLocked(v) || node != root) {
+      if (Node.isLocked(v) || top != root) {
         Thread.onSpinWait();
         continue;
       }
@@ -524,7 +529,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         while (!Node.isLeaf(head)) {
           Object[] slots = (Object[]) body;
           int i = childIndexLong(head, node, key);
-          Node child = Inner.child(slots, i);
+          Object child = Inner.childObject(slots, i);
           long[] childHead = Inner.childHead(slots, i);
           Object childBody = Inner.childBody(slots, i);
           long cv = Node.version(childHead);
@@ -600,8 +605,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   /**
    * The batch lookup of {@link #getMany}, {@link #getManyLong} and {@link #getManyLongValues}.
    * Exactly one of {@code keys} and {@code longKeys} is not {@code null}, and exactly one of
-   * {@code results} and {@code longResults}. Each lane holds the node, the head and the body of
-   * its position, as a lookup alone does.
+   * {@code results} and {@code longResults}.
    */
   private void getMany(
       Object[] keys,
@@ -612,12 +616,8 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
       long absent) {
     int lanes = Math.min(BATCH_LANES, length);
     Node[] nodes = new Node[lanes];
-    long[][] heads = new long[lanes][];
-    Object[] bodies = new Object[lanes];
+    Node[] children = new Node[lanes];
     long[] versions = new long[lanes];
-    Node[] childNodes = new Node[lanes];
-    long[][] childHeads = new long[lanes][];
-    Object[] childBodies = new Object[lanes];
     // The sum of the loads that only start cache misses. The final check keeps the JIT from
     // removing them.
     long touched = 0;
@@ -629,8 +629,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         }
       }
       Node top = root;
-      long[] topHead = top.head;
-      long tv = Node.version(topHead);
+      long tv = top.version();
       if (Node.isLocked(tv) || top != root) {
         for (int j = 0; j < n; j++) {
           store(results, longResults, start + j, keys, longKeys, absent);
@@ -638,58 +637,47 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
         continue;
       }
       Arrays.fill(nodes, 0, n, top);
-      Arrays.fill(heads, 0, n, topHead);
-      Arrays.fill(bodies, 0, n, top.body());
       Arrays.fill(versions, 0, n, tv);
       // All leaves are at the same depth, so the lanes reach the leaves together.
-      boolean inner = !Node.isLeaf(topHead);
+      boolean inner = top instanceof Inner;
       while (inner) {
         for (int j = 0; j < n; j++) {
-          childHeads[j] = null;
-          int i = childOf(heads[j], nodes[j], keys, longKeys, start + j);
-          if (i >= 0) {
-            Object[] slots = (Object[]) bodies[j];
-            childNodes[j] = Inner.child(slots, i);
-            childHeads[j] = Inner.childHead(slots, i);
-            childBodies[j] = Inner.childBody(slots, i);
-          }
+          children[j] = childOf(nodes[j], keys, longKeys, start + j);
         }
         for (int j = 0; j < n; j++) {
-          long[] h = childHeads[j];
-          touched += h != null ? h[Node.META] & 1 : 0;
+          Node child = children[j];
+          touched += child != null ? child.head[Node.META] & 1 : 0;
         }
         inner = false;
         for (int j = 0; j < n; j++) {
-          long[] parent = heads[j];
-          long[] child = childHeads[j];
-          heads[j] = null;
+          Node parent = nodes[j];
+          Node child = children[j];
+          nodes[j] = null;
           if (child != null) {
-            long cv = Node.version(child);
-            if (!Node.isLocked(cv) && Node.validate(parent, versions[j])) {
-              nodes[j] = childNodes[j];
-              heads[j] = child;
-              bodies[j] = childBodies[j];
+            long cv = child.version();
+            if (!Node.isLocked(cv) && parent.validate(versions[j])) {
+              nodes[j] = child;
               versions[j] = cv;
-              inner |= !Node.isLeaf(child);
+              inner |= child instanceof Inner;
             }
           }
         }
       }
       for (int j = 0; j < n; j++) {
-        int pos = positionIn(heads[j], nodes[j], keys, longKeys, start + j);
+        Node node = nodes[j];
+        int pos = node instanceof Leaf ? positionIn(node.head, node, keys, longKeys, start + j) : -1;
         if (pos == POSITION_FAILED) {
-          heads[j] = null;
+          nodes[j] = null;
           pos = -1;
         }
         if (longResults != null) {
-          longResults[start + j] = pos >= 0 ? ((long[]) bodies[j])[pos] : absent;
+          longResults[start + j] = pos >= 0 ? ((Leaf) node).longValues[pos] : absent;
         } else {
-          results[start + j] = pos >= 0 ? valueIn(bodies[j], pos) : null;
+          results[start + j] = pos >= 0 ? valueAt((Leaf) node, pos) : null;
         }
       }
       for (int j = 0; j < n; j++) {
-        long[] h = heads[j];
-        if (h == null || !Node.isLeaf(h) || !Node.validate(h, versions[j])) {
+        if (!(nodes[j] instanceof Leaf leaf) || !leaf.validate(versions[j])) {
           store(results, longResults, start + j, keys, longKeys, absent);
         }
       }
@@ -710,21 +698,23 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
   }
 
   /**
-   * Gives the child index in an inner node for key {@code i} of a batch, or -1 if the head is not
-   * an inner node or the read failed.
+   * Gives the child of an inner node for key {@code i} of a batch, or {@code null} if the read
+   * failed.
    */
   @SuppressWarnings("unchecked")
-  private int childOf(long[] head, Node node, Object[] keys, long[] longKeys, int i) {
-    if (head == null || Node.isLeaf(head)) {
-      return -1;
+  private Node childOf(Node node, Object[] keys, long[] longKeys, int i) {
+    if (!(node instanceof Inner inner)) {
+      return null;
     }
     try {
-      return keys != null
-          ? childIndex(head, node, (K) keys[i])
-          : childIndexLong(head, node, longKeys[i]);
+      int child =
+          keys != null
+              ? childIndex(inner.head, inner, (K) keys[i])
+              : childIndexLong(inner.head, inner, longKeys[i]);
+      return inner.child(child);
     } catch (RuntimeException e) {
       // The lookup alone repeats the read, and throws if the exception was not a stale read.
-      return -1;
+      return null;
     }
   }
 
@@ -737,7 +727,7 @@ public final class BBTreeMap<K, V> extends AbstractMap<K, V> implements Concurre
    * back to the lookup alone, which throws if the exception was not a stale read.
    */
   @SuppressWarnings("unchecked")
-  private int positionIn(long[] head, Node node, Object[] keys, long[] longKeys, int i) {
+  private int positionIn(long[] head, Object node, Object[] keys, long[] longKeys, int i) {
     if (head == null || !Node.isLeaf(head)) {
       return -1;
     }

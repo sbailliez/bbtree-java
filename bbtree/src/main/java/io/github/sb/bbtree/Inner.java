@@ -50,9 +50,12 @@ final class Inner extends Node {
     return (Node) slots[SLOTS * i];
   }
 
-  /** Gives child {@code i} of the inner node with these slots. */
-  static Node child(Object[] slots, int i) {
-    return (Node) slots[SLOTS * i];
+  /**
+   * Gives child {@code i} of the inner node with these slots, with no cast. A cast to {@link Node}
+   * would read the header of the child object, which is the load that the triples avoid.
+   */
+  static Object childObject(Object[] slots, int i) {
+    return slots[SLOTS * i];
   }
 
   /** Gives the head of child {@code i} of the inner node with these slots. */
